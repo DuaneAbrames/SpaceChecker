@@ -5,8 +5,191 @@ param(
     [ValidateRange(0,[int]::MaxValue)]
     [int]$MinFreeGB = 50,
 
-    [switch]$debug
+    [switch]$debug,
+    [switch]$DisableSelfUpdate,
+    [switch]$SkipSelfUpdate,
+    [string]$GitHubRepo = 'DuaneAbrames/SpaceChecker',
+    [string]$AssetRelativePath = 'check-diskspace.ps1',
+    [string]$FallbackBranch = 'main',
+    [string]$TargetDirectory = $(if ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } else { '.' }),
+    [string]$TaskNamePrefix = 'Check Disk Space'
 )
+
+function Get-LocalScriptVersion {
+    param([string]$ScriptPath)
+
+    if (-not $ScriptPath) { return '0.0.0' }
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
+    $match = [regex]::Match($name, 'check-diskspace v(?<ver>.+)$')
+    if ($match.Success) { return $match.Groups['ver'].Value }
+    return '0.0.0'
+}
+
+function Get-RemoteScriptMetadata {
+    param(
+        [Parameter(Mandatory)] [string]$Repo,
+        [Parameter(Mandatory)] [string]$AssetPath,
+        [Parameter(Mandatory)] [string]$FallbackBranch
+    )
+
+    $version = '0.0.0'
+    $releaseTag = $null
+    $downloadUri = $null
+    $apiUri = "https://api.github.com/repos/$Repo/releases/latest"
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'check-diskspace-selfupdate'; 'Accept' = 'application/vnd.github+json' }
+
+    try {
+        Write-Verbose "Querying GitHub release metadata from $apiUri"
+        $latestRelease = Invoke-RestMethod -Uri $apiUri -Headers $headers -UseBasicParsing
+
+        if ($latestRelease.tag_name) {
+            $releaseTag = $latestRelease.tag_name
+            $version = $latestRelease.tag_name.TrimStart('v')
+        } elseif ($latestRelease.name) {
+            $releaseTag = $latestRelease.name
+            $version = $latestRelease.name.TrimStart('v')
+        }
+
+        if ($releaseTag) {
+            $downloadUri = "https://raw.githubusercontent.com/$Repo/$releaseTag/$AssetPath"
+        }
+    } catch {
+        Write-Warning "Unable to retrieve GitHub release information: $($_.Exception.Message)"
+    }
+
+    if (-not $downloadUri) {
+        $releaseTag = $FallbackBranch
+        if ($version -eq '0.0.0') {
+            $version = Get-Date -Format 'yyyyMMddHHmmss'
+        }
+        $downloadUri = "https://raw.githubusercontent.com/$Repo/$FallbackBranch/$AssetPath"
+        Write-Verbose "Falling back to branch '$FallbackBranch' at $downloadUri"
+    }
+
+    return [pscustomobject]@{
+        Version     = $version
+        ReleaseTag  = $releaseTag
+        DownloadUri = $downloadUri
+    }
+}
+
+function Invoke-DeploymentUpdate {
+    param(
+        [Parameter(Mandatory)] [pscustomobject]$Metadata,
+        [Parameter(Mandatory)] [string]$TargetDirectory,
+        [Parameter(Mandatory)] [string]$TaskNamePrefix,
+        [Parameter()] [hashtable]$BoundParameters
+    )
+
+    if (-not (Test-Path -Path $TargetDirectory)) {
+        Write-Verbose "Creating target directory $TargetDirectory"
+        New-Item -Path $TargetDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $remoteVersion = $Metadata.Version
+    $targetPath = Join-Path -Path $TargetDirectory -ChildPath ("check-diskspace v{0}.ps1" -f $remoteVersion)
+    Write-Host "Downloading check-diskspace.ps1 (version $remoteVersion)"
+    Invoke-WebRequest -Uri $Metadata.DownloadUri -OutFile $targetPath -UseBasicParsing
+
+    Get-ChildItem -Path $TargetDirectory -Filter 'check-diskspace v*.ps1' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $targetPath } |
+        ForEach-Object {
+            try {
+                Remove-Item -Path $_.FullName -Force
+                Write-Host "Removed script: $($_.FullName)"
+            } catch {
+                Write-Warning "Failed to remove $($_.FullName): $($_.Exception.Message)"
+            }
+        }
+
+    Get-ScheduledTask -TaskName "$TaskNamePrefix*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            try {
+                Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false
+                Write-Host "Removed scheduled task: $($_.TaskName)"
+            } catch {
+                Write-Warning "Failed to remove scheduled task '$($_.TaskName)': $($_.Exception.Message)"
+            }
+        }
+
+    $escapedTargetPath = $targetPath.Replace('"', '""')
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$escapedTargetPath`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At 6:00AM
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -Compatibility Win8 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+    $taskName = "{0} (v{1})" -f $TaskNamePrefix, $remoteVersion
+    Write-Verbose "Registering scheduled task '$taskName'"
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Runs check-diskspace.ps1 v$remoteVersion at 6 AM daily" -Force | Out-Null
+    Write-Host "Scheduled task '$taskName' created to run $targetPath at 6 AM daily."
+
+    if (-not $BoundParameters) { $BoundParameters = @{} }
+    $relaunchParams = @{}
+    foreach ($kvp in $BoundParameters.GetEnumerator()) {
+        if ($kvp.Key -ne 'SkipSelfUpdate') {
+            $relaunchParams[$kvp.Key] = $kvp.Value
+        }
+    }
+    $relaunchParams['SkipSelfUpdate'] = $true
+
+    Write-Host 'Re-launching updated script.'
+    & $targetPath @relaunchParams
+    $global:LASTEXITCODE = $LASTEXITCODE
+    throw [System.OperationCanceledException]::new('Self-update applied; reran updated script.')
+}
+
+function Invoke-SelfUpdate {
+    param(
+        [Parameter(Mandatory)] [string]$Repo,
+        [Parameter(Mandatory)] [string]$AssetPath,
+        [Parameter(Mandatory)] [string]$FallbackBranch,
+        [Parameter(Mandatory)] [string]$TargetDirectory,
+        [Parameter(Mandatory)] [string]$TaskNamePrefix,
+        [Parameter(Mandatory)] [string]$ScriptPath,
+        [Parameter()] [hashtable]$BoundParameters
+    )
+
+    $localVersion = Get-LocalScriptVersion -ScriptPath $ScriptPath
+    $metadata = Get-RemoteScriptMetadata -Repo $Repo -AssetPath $AssetPath -FallbackBranch $FallbackBranch
+    if (-not $metadata) { return }
+
+    $remoteVersion = $metadata.Version
+    $comparePerformed = $false
+    $shouldUpdate = $false
+
+    try {
+        $currentVersionObj = $null
+        $remoteVersionObj = $null
+        if ([System.Version]::TryParse($localVersion, [ref]$currentVersionObj) -and
+            [System.Version]::TryParse($remoteVersion, [ref]$remoteVersionObj)) {
+            $comparePerformed = $true
+            $shouldUpdate = ($remoteVersionObj -gt $currentVersionObj)
+        }
+    } catch {
+        $comparePerformed = $false
+    }
+
+    if (-not $comparePerformed) {
+        $shouldUpdate = -not ($localVersion -eq $remoteVersion)
+    }
+
+    if ($shouldUpdate) {
+        Write-Host "Self-update: local version $localVersion, remote version $remoteVersion"
+        Invoke-DeploymentUpdate -Metadata $metadata -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -BoundParameters $BoundParameters
+    } else {
+        Write-Verbose "Self-update: local version $localVersion is up to date (remote $remoteVersion)."
+    }
+}
+
+if (-not $DisableSelfUpdate -and -not $SkipSelfUpdate) {
+    try {
+        Invoke-SelfUpdate -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
+    } catch [System.OperationCanceledException] {
+        return
+    }
+}
 
 $SmtpServer = 'nettek-com.mail.protection.outlook.com'
 $From = 'noreply@nettek.com'
@@ -20,10 +203,9 @@ if ($debug) {
 $SmtpPort = 25
 $UseSsl = $true
 $ComputerName = $env:COMPUTERNAME
-$timestamp = Get-Date -Format 'MM-dd-yy HH:mm'
-$Subject = "Disk space alert on $ComputerName ($timestamp)"
+$timestampSubject = Get-Date -Format 'MM-dd-yy HH:mm'
+$Subject = "Disk space alert on $ComputerName ($timestampSubject)"
 
-# Acquire logical disks and return current usage metrics.
 try {
     $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3'
 } catch {
@@ -173,7 +355,7 @@ if ($alertDisks -or $debug) {
     if ($clusterDetected) {
         $thresholdDescription += ' Cluster Shared Volumes detected.'
     }
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $timestampBody = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
     $driveBlocks = foreach ($item in $sortedReport) {
         $status = if ($item.AlertTriggered) { '***ALERT***' } else { 'OK' }
@@ -194,7 +376,7 @@ if ($alertDisks -or $debug) {
     $bodySections = $driveBlocks -join ([Environment]::NewLine + [Environment]::NewLine)
 
     $bodyLines = @(
-        "Disk space report for $ComputerName generated at $timestamp.",
+        "Disk space report for $ComputerName generated at $timestampBody.",
         $thresholdDescription,
         '',
         $bodySections
