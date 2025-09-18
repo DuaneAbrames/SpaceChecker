@@ -57,10 +57,12 @@ foreach ($disk in $disks) {
 
 $clusterDetected = $false
 $csvVolumes = @()
+$allVolumes = @()
 
 if (Get-Command -Name Get-ClusterSharedVolume -ErrorAction SilentlyContinue) {
     try {
         $csvVolumes = Get-ClusterSharedVolume -ErrorAction Stop
+        $allVolumes = Get-CimInstance -ClassName Win32_Volume -ErrorAction Stop
     } catch {
         Write-Warning "Detected Failover Clustering cmdlets but failed to enumerate Cluster Shared Volumes: $($_.Exception.Message)"
     }
@@ -76,32 +78,37 @@ if ($csvVolumes) {
         $friendlyName = if ($info.FriendlyVolumeName) { $info.FriendlyVolumeName.Trim() } else { $csvVolume.Name }
         $displayName = if ($friendlyName) { "CSV: $friendlyName" } else { "CSV: $($csvVolume.Name)" }
 
-        $hasTotal = $info.PSObject.Properties.Match('TotalSize').Count -gt 0 -and $info.TotalSize -ne $null
-        $hasFree = $info.PSObject.Properties.Match('FreeSpace').Count -gt 0 -and $info.FreeSpace -ne $null
+        $hasTotal = $info.PSObject.Properties['TotalSize'] -and $info.TotalSize -ne $null -and $info.TotalSize -gt 0
+        $hasFree = $info.PSObject.Properties['FreeSpace'] -and $info.FreeSpace -ne $null -and $info.FreeSpace -ge 0
 
         $sizeBytes = if ($hasTotal) { [double]$info.TotalSize } else { 0 }
         $freeBytes = if ($hasFree) { [double]$info.FreeSpace } else { 0 }
 
-        if (-not $hasTotal -or -not $hasFree) {
-            try {
-                $volume = $null
-                if ($info.VolumeName) {
-                    $escapedVolumeName = ($info.VolumeName -replace '\\', '\\\\' -replace "'", "''")
-                    $volume = Get-CimInstance -ClassName Win32_Volume -Filter ("DeviceID = '{0}'" -f $escapedVolumeName) -ErrorAction Stop
-                }
+        if (-not $hasTotal -or -not $hasFree -or $sizeBytes -eq 0) {
+            $volume = $null
 
-                if (-not $volume -and $friendlyName) {
-                    $mountPath = "C:\\ClusterStorage\\$friendlyName\\"
-                    $escapedMountPath = ($mountPath -replace '\\', '\\\\' -replace "'", "''")
-                    $volume = Get-CimInstance -ClassName Win32_Volume -Filter ("Name = '{0}'" -f $escapedMountPath) -ErrorAction Stop
-                }
+            if ($info.VolumeName) {
+                $volume = $allVolumes | Where-Object { $_.DeviceID -eq $info.VolumeName }
+            }
 
-                if ($volume) {
-                    $sizeBytes = [double]$volume.Capacity
-                    $freeBytes = [double]$volume.FreeSpace
+            if (-not $volume -and $friendlyName) {
+                $mountPath = "C:\\ClusterStorage\\$friendlyName\\"
+                $volume = $allVolumes | Where-Object { $_.Name -eq $mountPath }
+            }
+
+            if (-not $volume -and $info.MountPoints) {
+                foreach ($mountPoint in $info.MountPoints) {
+                    $normalized = if ($mountPoint.EndsWith('\')) { $mountPoint } else { "$mountPoint\" }
+                    $volume = $allVolumes | Where-Object { $_.Name -eq $normalized }
+                    if ($volume) { break }
                 }
-            } catch {
-                Write-Warning "Unable to determine size for CSV '$displayName': $($_.Exception.Message)"
+            }
+
+            if ($volume) {
+                $sizeBytes = [double]$volume.Capacity
+                $freeBytes = [double]$volume.FreeSpace
+            } else {
+                Write-Warning "Unable to determine size for CSV '$displayName' using available metadata."
                 continue
             }
         }
