@@ -20,7 +20,8 @@ if ($debug) {
 $SmtpPort = 25
 $UseSsl = $true
 $ComputerName = $env:COMPUTERNAME
-$Subject = "Disk space alert on $ComputerName"
+$timestamp = Get-Date -Format 'MM-dd-yy HH:mm'
+$Subject = "Disk space alert on $ComputerName ($timestamp)"
 
 # Acquire logical disks and return current usage metrics.
 try {
@@ -78,25 +79,52 @@ if ($csvVolumes) {
         $friendlyName = if ($info.FriendlyVolumeName) { $info.FriendlyVolumeName.Trim() } else { $csvVolume.Name }
         $displayName = if ($friendlyName) { "CSV: $friendlyName" } else { "CSV: $($csvVolume.Name)" }
 
-        $hasTotal = $info.PSObject.Properties['TotalSize'] -and $info.TotalSize -ne $null -and $info.TotalSize -gt 0
-        $hasFree = $info.PSObject.Properties['FreeSpace'] -and $info.FreeSpace -ne $null -and $info.FreeSpace -ge 0
+        $sizeBytes = 0.0
+        $freeBytes = 0.0
 
-        $sizeBytes = if ($hasTotal) { [double]$info.TotalSize } else { 0 }
-        $freeBytes = if ($hasFree) { [double]$info.FreeSpace } else { 0 }
+        if ($info.PSObject.Properties['TotalSize'] -and $info.TotalSize) {
+            $sizeBytes = [double]$info.TotalSize
+        }
+        if ($info.PSObject.Properties['FreeSpace'] -and $info.FreeSpace -ne $null) {
+            $freeBytes = [double]$info.FreeSpace
+        }
 
-        if (-not $hasTotal -or -not $hasFree -or $sizeBytes -eq 0) {
+        $partition = $info.Partition
+        if ($partition) {
+            if ($partition.PSObject.Properties['Size'] -and $partition.Size) {
+                $sizeBytes = [double]$partition.Size
+            }
+            if ($partition.PSObject.Properties['FreeSpace'] -and $partition.FreeSpace -ne $null) {
+                $freeBytes = [double]$partition.FreeSpace
+            }
+        }
+
+        $needsVolumeLookup = ($sizeBytes -le 0)
+
+        if ($needsVolumeLookup) {
             $volume = $null
 
-            if ($info.VolumeName) {
+            if ($info.PSObject.Properties['VolumeName'] -and $info.VolumeName) {
                 $volume = $allVolumes | Where-Object { $_.DeviceID -eq $info.VolumeName }
             }
 
-            if (-not $volume -and $friendlyName) {
-                $mountPath = "C:\\ClusterStorage\\$friendlyName\\"
-                $volume = $allVolumes | Where-Object { $_.Name -eq $mountPath }
+            if (-not $volume -and $partition -and $partition.PSObject.Properties['Name'] -and $partition.Name) {
+                $volume = $allVolumes | Where-Object { $_.DeviceID -eq $partition.Name }
             }
 
-            if (-not $volume -and $info.MountPoints) {
+            if (-not $volume -and $friendlyName) {
+                $mountPath = "C:\\ClusterStorage\\$friendlyName"
+                $alternates = @(
+                    $mountPath,
+                    "$mountPath\\"
+                )
+                foreach ($candidate in $alternates) {
+                    $volume = $allVolumes | Where-Object { $_.Name -eq $candidate }
+                    if ($volume) { break }
+                }
+            }
+
+            if (-not $volume -and $info.PSObject.Properties['MountPoints'] -and $info.MountPoints) {
                 foreach ($mountPoint in $info.MountPoints) {
                     $normalized = if ($mountPoint.EndsWith('\')) { $mountPoint } else { "$mountPoint\" }
                     $volume = $allVolumes | Where-Object { $_.Name -eq $normalized }
@@ -105,8 +133,8 @@ if ($csvVolumes) {
             }
 
             if ($volume) {
-                $sizeBytes = [double]$volume.Capacity
-                $freeBytes = [double]$volume.FreeSpace
+                if ($volume.Capacity) { $sizeBytes = [double]$volume.Capacity }
+                if ($volume.FreeSpace -ne $null) { $freeBytes = [double]$volume.FreeSpace }
             } else {
                 Write-Warning "Unable to determine size for CSV '$displayName' using available metadata."
                 continue
