@@ -20,7 +20,7 @@ if ($debug) {
 $SmtpPort = 25
 $UseSsl = $true
 $ComputerName = $env:COMPUTERNAME
-$Subject = "Disk space alert on $ComputerName at $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+$Subject = "Disk space alert on $ComputerName"
 
 # Acquire logical disks and return current usage metrics.
 try {
@@ -32,10 +32,11 @@ try {
 
 if (-not $disks) {
     Write-Warning "No fixed disks found on $ComputerName."
-    return
 }
 
-$report = foreach ($disk in $disks) {
+$report = @()
+
+foreach ($disk in $disks) {
     if (-not $disk.Size) { continue }
 
     $sizeBytes = [double]$disk.Size
@@ -43,18 +44,90 @@ $report = foreach ($disk in $disks) {
     $freeGBExact = $freeBytes / 1GB
     $usedPercentExact = if ($sizeBytes -eq 0) { 0 } else { (($sizeBytes - $freeBytes) / $sizeBytes) * 100 }
 
-    [pscustomobject]@{
+    $report += [pscustomobject]@{
         ComputerName   = $disk.SystemName
         Drive          = $disk.DeviceID
         SizeGB         = [Math]::Round($sizeBytes / 1GB, 2)
         FreeGB         = [Math]::Round($freeGBExact, 2)
         UsedPercent    = [Math]::Round($usedPercentExact, 1)
         AlertTriggered = ($usedPercentExact -ge $PercentUsedThreshold) -or ($freeGBExact -lt $MinFreeGB)
+        Source         = 'LogicalDisk'
     }
 }
 
-$sortedReport = $report | Sort-Object Drive
-$reportTable = $sortedReport | Format-Table Drive, SizeGB, FreeGB, UsedPercent, AlertTriggered -AutoSize | Out-String
+$clusterDetected = $false
+$csvVolumes = @()
+
+if (Get-Command -Name Get-ClusterSharedVolume -ErrorAction SilentlyContinue) {
+    try {
+        $csvVolumes = Get-ClusterSharedVolume -ErrorAction Stop
+    } catch {
+        Write-Warning "Detected Failover Clustering cmdlets but failed to enumerate Cluster Shared Volumes: $($_.Exception.Message)"
+    }
+}
+
+if ($csvVolumes) {
+    $clusterDetected = $true
+
+    foreach ($csvVolume in $csvVolumes) {
+        $info = $csvVolume.SharedVolumeInfo
+        if (-not $info) { continue }
+
+        $friendlyName = if ($info.FriendlyVolumeName) { $info.FriendlyVolumeName.Trim() } else { $csvVolume.Name }
+        $displayName = if ($friendlyName) { "CSV: $friendlyName" } else { "CSV: $($csvVolume.Name)" }
+
+        $hasTotal = $info.PSObject.Properties.Match('TotalSize').Count -gt 0 -and $info.TotalSize -ne $null
+        $hasFree = $info.PSObject.Properties.Match('FreeSpace').Count -gt 0 -and $info.FreeSpace -ne $null
+
+        $sizeBytes = if ($hasTotal) { [double]$info.TotalSize } else { 0 }
+        $freeBytes = if ($hasFree) { [double]$info.FreeSpace } else { 0 }
+
+        if (-not $hasTotal -or -not $hasFree) {
+            try {
+                $volume = $null
+                if ($info.VolumeName) {
+                    $escapedVolumeName = ($info.VolumeName -replace '\\', '\\\\' -replace "'", "''")
+                    $volume = Get-CimInstance -ClassName Win32_Volume -Filter ("DeviceID = '{0}'" -f $escapedVolumeName) -ErrorAction Stop
+                }
+
+                if (-not $volume -and $friendlyName) {
+                    $mountPath = "C:\\ClusterStorage\\$friendlyName\\"
+                    $escapedMountPath = ($mountPath -replace '\\', '\\\\' -replace "'", "''")
+                    $volume = Get-CimInstance -ClassName Win32_Volume -Filter ("Name = '{0}'" -f $escapedMountPath) -ErrorAction Stop
+                }
+
+                if ($volume) {
+                    $sizeBytes = [double]$volume.Capacity
+                    $freeBytes = [double]$volume.FreeSpace
+                }
+            } catch {
+                Write-Warning "Unable to determine size for CSV '$displayName': $($_.Exception.Message)"
+                continue
+            }
+        }
+
+        $freeGBExact = $freeBytes / 1GB
+        $usedPercentExact = if ($sizeBytes -eq 0) { 0 } else { (($sizeBytes - $freeBytes) / $sizeBytes) * 100 }
+
+        $report += [pscustomobject]@{
+            ComputerName   = $ComputerName
+            Drive          = $displayName
+            SizeGB         = [Math]::Round($sizeBytes / 1GB, 2)
+            FreeGB         = [Math]::Round($freeGBExact, 2)
+            UsedPercent    = [Math]::Round($usedPercentExact, 1)
+            AlertTriggered = ($usedPercentExact -ge $PercentUsedThreshold) -or ($freeGBExact -lt $MinFreeGB)
+            Source         = 'CSV'
+        }
+    }
+}
+
+if (-not $report) {
+    Write-Warning "No disk data collected on $ComputerName."
+    return
+}
+
+$sortedReport = $report | Sort-Object Source, Drive
+$reportTable = $sortedReport | Format-Table Drive, SizeGB, FreeGB, UsedPercent, AlertTriggered, Source -AutoSize | Out-String
 Write-Host $reportTable
 
 $alertDisks = $sortedReport | Where-Object { $_.AlertTriggered }
@@ -62,6 +135,9 @@ Write-Host "debug: $debug"
 
 if ($alertDisks -or $debug) {
     $thresholdDescription = "Thresholds: used >= $PercentUsedThreshold% or free < $MinFreeGB GB."
+    if ($clusterDetected) {
+        $thresholdDescription += ' Cluster Shared Volumes detected.'
+    }
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
     $driveBlocks = foreach ($item in $sortedReport) {
