@@ -66,6 +66,7 @@ Get-ChildItem -Path $TargetDirectory -Filter 'check-diskspace v*.ps1' -File -Err
     ForEach-Object {
         try {
             Remove-Item -Path $_.FullName -Force
+            Write-Host "Removed script: $($_.FullName)"
             Write-Verbose "Removed $($_.FullName)"
         } catch {
             Write-Warning "Failed to remove $($_.FullName): $($_.Exception.Message)"
@@ -77,6 +78,7 @@ Get-ScheduledTask -TaskName "$taskNamePrefix*" -ErrorAction SilentlyContinue |
     ForEach-Object {
         try {
             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false
+            Write-Host "Removed scheduled task: $($_.TaskName)"
             Write-Verbose "Removed scheduled task '$($_.TaskName)'"
         } catch {
             Write-Warning "Failed to remove scheduled task '$($_.TaskName)': $($_.Exception.Message)"
@@ -93,7 +95,9 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings = New-ScheduledTaskSettingsSet -Compatibility Win8 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 Write-Verbose "Registering scheduled task '$taskName'"
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Runs check-diskspace.ps1 v$version at 6 AM daily" -Force | Out-Null
+$results = Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Runs check-diskspace.ps1 v$version at 6 AM daily" -Force 
 
-Write-Host "Scheduled task '$taskName' created to run $targetPath at 6 AM daily."
-Write-Output @{ Version = $version; ScriptPath = $targetPath; TaskName = $taskName }
+Write-Host "Scheduled task '$taskName' created."
+Write-Host  "run  : $targetPath `nat   : 6 AM daily."
+Write-host "---- Script Complete ----"
+
