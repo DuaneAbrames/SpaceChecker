@@ -1,6 +1,6 @@
 {
-  "PercentUsedThreshold": 90,
-  "MinFreeGB": 50,
+  "PercentUsedThreshold": 95,
+  "MinFreeGB": 10,
   "SmtpServer": "nettek-com.mail.protection.outlook.com",
   "SmtpPort": 25,
   "UseSsl": true,

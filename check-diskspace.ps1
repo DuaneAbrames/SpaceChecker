@@ -16,7 +16,7 @@ param(
     [string]$ScheduleTime,
     [string]$ConfigRelativePath = 'check-diskspace-config.json'
 )
-
+$debug = $true
 function Get-ScriptDirectory {
     param([string]$Path)
 
@@ -102,7 +102,7 @@ function Ensure-ConfigFile {
             Write-Host "Configuration downloaded from $ConfigSourceUrl"
             $downloaded = $true
         } catch {
-            Write-Warning "Failed to download configuration from $ConfigSourceUrl: $($_.Exception.Message)"
+            Write-Warning "Failed to download configuration from $($ConfigSourceUrl): $($_.Exception.Message)"
         }
     }
 
@@ -121,7 +121,7 @@ function Ensure-ConfigFile {
                 $downloaded = $true
                 break
             } catch {
-                Write-Warning "Failed to download configuration from $configUri: $($_.Exception.Message)"
+                Write-Warning "Failed to download configuration from $($configUri): $($_.Exception.Message)"
             }
         }
     }
@@ -138,7 +138,7 @@ function Load-Configuration {
         $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
         return $raw | ConvertFrom-Json
     } catch {
-        throw "Failed to parse configuration at $ConfigPath: $($_.Exception.Message)"
+        throw "Failed to parse configuration at $($ConfigPath): $($_.Exception.Message)"
     }
 }
 
