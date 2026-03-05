@@ -1,9 +1,9 @@
 param(
     [ValidateRange(1,100)]
-    [int]$PercentUsedThreshold = 90,
+    [int]$PercentUsedThreshold = 95,
 
     [ValidateRange(0,[int]::MaxValue)]
-    [int]$MinFreeGB = 50,
+    [int]$MinFreeGB = 10,
 
     [switch]$debug,
     [switch]$DisableSelfUpdate,
