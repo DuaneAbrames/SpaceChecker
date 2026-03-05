@@ -8,16 +8,81 @@ param(
     [string]$ConfigRelativePath = 'check-diskspace-config.json',
     [string]$TargetDirectory,
     [string]$TaskNamePrefix,
-    [string]$ScheduleTime
+    [string]$ScheduleTime,
+    [STRING]$configSourceUrl = "" #PROBABLY WON'T USE THIS
 )
+
+##########################################################################################
+#  IMPORTANT: YOU CAN SET THIS TO YOUR OWN CONFIG URL OR PROVIDE A LOCAL CONFIG FILE     #
+#  OR, MAKE SURE THE ENVIRONMENT VARIABLE 'CheckDiskSpaceConfig' IS SET TO A VALID URL   #
+#  THE SCRIPT WILL ALSO TRY TO CONSTRUCT A URL BASED ON THE PRIMARY DNS DOMAIN           #
+#  (e.g. https://space.yourdomain.com/check-diskspace-config.json)                       #
+##########################################################################################
+$configSourceUrl = ""
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $scriptDirectory = if ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } else { (Get-Location).ProviderPath }
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
-$configSourceUrl = $env:CheckDiskSpaceConfig
+
+# Environment variable can override config source URL, and if it looks like a URL, we'll try to download from it first 
+if ($env:CheckDiskSpaceConfig) {
+    Write-Verbose "Environment variable 'CheckDiskSpaceConfig' is set to '$($env:CheckDiskSpaceConfig)'"
+    $configSourceUrl = $env:CheckDiskSpaceConfig
+} else {
+    Write-Verbose "Environment variable 'CheckDiskSpaceConfig' is not set."
+}
+if ($configSourceUrl -like "") {
+    $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
+    if ($configSourceUrl) {
+        Write-Verbose "Constructed config source URL based on primary DNS domain: $configSourceUrl"
+    } else {
+        Write-Verbose "Could not determine primary DNS domain or construct config source URL."
+    }
+}
+
+# Persist the resolved config URL for future runs (machine scope).
+if ($configSourceUrl) {
+    try {
+        [Environment]::SetEnvironmentVariable('CheckDiskSpaceConfig', $configSourceUrl, 'Machine')
+    } catch {
+        Write-Warning "Unable to persist CheckDiskSpaceConfig at machine scope: $($_.Exception.Message)"
+    }
+}
+
 $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
+
+function Get-PrimaryDnsDomain {
+    # Try common sources for the machine's primary DNS domain and return the first usable value.
+    $candidates = @()
+
+    if ($env:USERDNSDOMAIN) { $candidates += $env:USERDNSDOMAIN }
+
+    try {
+        $csDomain = (Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop).Domain
+        if ($csDomain -and $csDomain -ne $env:COMPUTERNAME) { $candidates += $csDomain }
+    } catch {}
+
+    try {
+        $dnsSettings = Get-DnsClientGlobalSetting -ErrorAction Stop
+        if ($dnsSettings.PrimaryDnsSuffix) { $candidates += $dnsSettings.PrimaryDnsSuffix }
+        if ($dnsSettings.SuffixSearchList) { $candidates += $dnsSettings.SuffixSearchList }
+    } catch {}
+
+    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1)?.ToLowerInvariant()
+}
+
+function Get-ConfigUrlFromPrimaryDomain {
+    param([string]$ConfigFileName = $ConfigRelativePath)
+
+    $domain = Get-PrimaryDnsDomain
+    if (-not $domain) { return $null }
+    if (-not $ConfigFileName) { $ConfigFileName = 'check-diskspace-config.json' }
+
+    $fileName = $ConfigFileName.TrimStart('/','\\')
+    return "https://space.{0}/{1}" -f $domain.Trim(), $fileName
+}
 
 function Get-RemoteScriptMetadata {
     param(
