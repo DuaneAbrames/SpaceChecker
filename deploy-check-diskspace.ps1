@@ -11,7 +11,7 @@ param(
     [string]$ScheduleTime,
     [STRING]$configSourceUrl = "" #PROBABLY WON'T USE THIS
 )
-
+$verbose = $true
 ##########################################################################################
 #  IMPORTANT: YOU CAN SET THIS TO YOUR OWN CONFIG URL OR PROVIDE A LOCAL CONFIG FILE     #
 #  OR, MAKE SURE THE ENVIRONMENT VARIABLE 'CheckDiskSpaceConfig' IS SET TO A VALID URL   #
@@ -26,32 +26,6 @@ Set-StrictMode -Version Latest
 $scriptDirectory = if ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } else { (Get-Location).ProviderPath }
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
 
-# Environment variable can override config source URL, and if it looks like a URL, we'll try to download from it first 
-if ($env:CheckDiskSpaceConfig) {
-    Write-Verbose "Environment variable 'CheckDiskSpaceConfig' is set to '$($env:CheckDiskSpaceConfig)'"
-    $configSourceUrl = $env:CheckDiskSpaceConfig
-} else {
-    Write-Verbose "Environment variable 'CheckDiskSpaceConfig' is not set."
-}
-if ($configSourceUrl -like "") {
-    $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
-    if ($configSourceUrl) {
-        Write-Verbose "Constructed config source URL based on primary DNS domain: $configSourceUrl"
-    } else {
-        Write-Verbose "Could not determine primary DNS domain or construct config source URL."
-    }
-}
-
-# Persist the resolved config URL for future runs (machine scope).
-if ($configSourceUrl) {
-    try {
-        [Environment]::SetEnvironmentVariable('CheckDiskSpaceConfig', $configSourceUrl, 'Machine')
-    } catch {
-        Write-Warning "Unable to persist CheckDiskSpaceConfig at machine scope: $($_.Exception.Message)"
-    }
-}
-
-$forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
 
 function Get-PrimaryDnsDomain {
     # Try common sources for the machine's primary DNS domain and return the first usable value.
@@ -70,7 +44,7 @@ function Get-PrimaryDnsDomain {
         if ($dnsSettings.SuffixSearchList) { $candidates += $dnsSettings.SuffixSearchList }
     } catch {}
 
-    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1)?.ToLowerInvariant()
+    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1).ToLowerInvariant()
 }
 
 function Get-ConfigUrlFromPrimaryDomain {
@@ -80,9 +54,46 @@ function Get-ConfigUrlFromPrimaryDomain {
     if (-not $domain) { return $null }
     if (-not $ConfigFileName) { $ConfigFileName = 'check-diskspace-config.json' }
 
-    $fileName = $ConfigFileName.TrimStart('/','\\')
+    $fileName = $ConfigFileName.TrimStart('/','\').TrimStart('/','\').TrimStart('/','\')
     return "https://space.{0}/{1}" -f $domain.Trim(), $fileName
 }
+
+
+
+# Environment variable can override config source URL, and if it looks like a URL, we'll try to download from it first 
+if ($env:CheckDiskSpaceConfig) {
+    Write-Host "Environment variable 'CheckDiskSpaceConfig' is set to '$($env:CheckDiskSpaceConfig)'"
+    $configSourceUrl = $env:CheckDiskSpaceConfig
+} else {
+    Write-Host "Environment variable 'CheckDiskSpaceConfig' is not set."
+}
+if ($configSourceUrl -like "") {
+    $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
+    if ($configSourceUrl) {
+        Write-Host "Constructed config source URL based on primary DNS domain: $configSourceUrl"
+    } else {
+        Write-Host "Could not determine primary DNS domain or construct config source URL."
+    }
+}
+
+# Persist the resolved config URL for future runs (machine scope).
+if ($configSourceUrl) {
+    try {
+        [Environment]::SetEnvironmentVariable('CheckDiskSpaceConfig', $configSourceUrl, 'Machine')
+        Write-Host "Persisted config source URL '$configSourceUrl' to machine environment variable 'CheckDiskSpaceConfig'"
+    } catch {
+        Write-Warning "Unable to persist CheckDiskSpaceConfig at machine scope: $($_.Exception.Message)"
+    }
+}
+
+$forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
+if ($forceConfigDownload) {
+    Write-Host "Forcing configuration download from $configSourceUrl on each run."
+} else {
+    Write-Host "No valid config source URL; will rely on existing config file at $configPath or throw if missing."
+}
+
+
 
 function Get-RemoteScriptMetadata {
     param(
@@ -100,7 +111,7 @@ function Get-RemoteScriptMetadata {
     $headers = @{ 'User-Agent' = 'deploy-check-diskspace'; 'Accept' = 'application/vnd.github+json' }
 
     try {
-        Write-Verbose "Querying GitHub release metadata from $apiUri"
+        Write-Host "Querying GitHub release metadata from $apiUri"
         $latestRelease = Invoke-RestMethod -Uri $apiUri -Headers $headers -UseBasicParsing
 
         if ($latestRelease.tag_name) {
@@ -124,7 +135,7 @@ function Get-RemoteScriptMetadata {
             $version = Get-Date -Format 'yyyyMMddHHmmss'
         }
         $downloadUri = "https://raw.githubusercontent.com/$Repo/$FallbackBranch/$AssetPath"
-        Write-Verbose "Falling back to branch '$FallbackBranch' at $downloadUri"
+        Write-Host "Falling back to branch '$FallbackBranch' at $downloadUri"
     }
 
     return [pscustomobject]@{
@@ -237,7 +248,7 @@ Ensure-ConfigFile -ConfigPath $configPath -Metadata $metadata -Repo $GitHubRepo 
 $triggerTime = Get-DailyTriggerTime -TimeString $ScheduleTime
 
 if (-not (Test-Path -Path $TargetDirectory)) {
-    Write-Verbose "Creating target directory $TargetDirectory"
+    Write-Host "Creating target directory $TargetDirectory"
     New-Item -Path $TargetDirectory -ItemType Directory -Force | Out-Null
 }
 
@@ -279,11 +290,11 @@ $taskDescription = "Runs check-diskspace.ps1 v{0} at {1} daily" -f $metadata.Ver
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $taskDescription -Force | Out-Null
 Write-Host ("Scheduled task '{0}' created to run {1} at {2} daily." -f $taskName, $targetPath, $triggerTime.ToShortTimeString())
 
-Write-Output [pscustomobject]@{
+Write-Output ([pscustomobject]@{
     Version        = $metadata.Version
     ScriptPath     = $targetPath
     TaskName       = $taskName
     ScheduleTime   = $triggerTime.ToShortTimeString()
     ConfigPath     = $configPath
     TargetConfig   = Join-Path $TargetDirectory $ConfigRelativePath
-}
+})

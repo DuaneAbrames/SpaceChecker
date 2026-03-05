@@ -302,7 +302,9 @@ $scriptDirectory = Get-ScriptDirectory -Path $PSCommandPath
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
 $configSourceUrl = $env:CheckDiskSpaceConfig
 $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
-
+if ($forceConfigDownload) {
+    Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
+}
 $initialMetadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
 Ensure-ConfigFile -ConfigPath $configPath -Metadata $initialMetadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
 $config = Load-Configuration -ConfigPath $configPath
