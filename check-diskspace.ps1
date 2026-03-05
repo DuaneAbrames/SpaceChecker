@@ -11,9 +11,18 @@ param(
     [string]$GitHubRepo = 'DuaneAbrames/SpaceChecker',
     [string]$AssetRelativePath = 'check-diskspace.ps1',
     [string]$FallbackBranch = 'main',
-    [string]$TargetDirectory = $(if ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } else { '.' }),
-    [string]$TaskNamePrefix = 'Check Disk Space'
+    [string]$TargetDirectory,
+    [string]$TaskNamePrefix,
+    [string]$ScheduleTime,
+    [string]$ConfigRelativePath = 'check-diskspace-config.json'
 )
+
+function Get-ScriptDirectory {
+    param([string]$Path)
+
+    if ($Path) { return Split-Path -Path $Path -Parent }
+    return (Get-Location).ProviderPath
+}
 
 function Get-LocalScriptVersion {
     param([string]$ScriptPath)
@@ -75,11 +84,106 @@ function Get-RemoteScriptMetadata {
     }
 }
 
+function Ensure-ConfigFile {
+    param(
+        [Parameter(Mandatory)] [string]$ConfigPath,
+        [pscustomobject]$Metadata,
+        [Parameter(Mandatory)] [string]$Repo,
+        [Parameter(Mandatory)] [string]$FallbackBranch,
+        [Parameter(Mandatory)] [string]$RelativePath,
+        [string]$ConfigSourceUrl,
+        [switch]$ForceDownload
+    )
+
+    $downloaded = $false
+    if ($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://') {
+        try {
+            Invoke-WebRequest -Uri $ConfigSourceUrl -OutFile $ConfigPath -UseBasicParsing -ErrorAction Stop
+            Write-Host "Configuration downloaded from $ConfigSourceUrl"
+            $downloaded = $true
+        } catch {
+            Write-Warning "Failed to download configuration from $ConfigSourceUrl: $($_.Exception.Message)"
+        }
+    }
+
+    if ($downloaded) { return }
+
+    if ($ForceDownload -or -not (Test-Path -Path $ConfigPath)) {
+        $tagsToTry = @()
+        if ($Metadata -and $Metadata.ReleaseTag) { $tagsToTry += $Metadata.ReleaseTag }
+        if (-not $tagsToTry.Contains($FallbackBranch)) { $tagsToTry += $FallbackBranch }
+
+        foreach ($tag in $tagsToTry) {
+            $configUri = "https://raw.githubusercontent.com/$Repo/$tag/$RelativePath"
+            try {
+                Invoke-WebRequest -Uri $configUri -OutFile $ConfigPath -UseBasicParsing -ErrorAction Stop
+                Write-Host "Configuration downloaded from $configUri"
+                $downloaded = $true
+                break
+            } catch {
+                Write-Warning "Failed to download configuration from $configUri: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if (-not (Test-Path -Path $ConfigPath)) {
+        throw "Configuration file not found at $ConfigPath. Provide one or set the CheckDiskSpaceConfig environment variable."
+    }
+}
+
+function Load-Configuration {
+    param([Parameter(Mandatory)] [string]$ConfigPath)
+
+    try {
+        $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+        return $raw | ConvertFrom-Json
+    } catch {
+        throw "Failed to parse configuration at $ConfigPath: $($_.Exception.Message)"
+    }
+}
+
+function Get-DailyTriggerTime {
+    param([string]$TimeString)
+
+    if ([string]::IsNullOrWhiteSpace($TimeString)) {
+        return [DateTime]::Today.AddHours(6)
+    }
+
+    $formats = @('hh\:mm','h\:mm','HH\:mm')
+    foreach ($fmt in $formats) {
+        try {
+            $timeSpan = [TimeSpan]::ParseExact($TimeString, $fmt, [System.Globalization.CultureInfo]::InvariantCulture)
+            return [DateTime]::Today.Add($timeSpan)
+        } catch {}
+    }
+
+    try {
+        $timeSpan = [TimeSpan]::Parse($TimeString, [System.Globalization.CultureInfo]::InvariantCulture)
+        return [DateTime]::Today.Add($timeSpan)
+    } catch {}
+
+    Write-Warning "Unable to parse schedule time '$TimeString'; defaulting to 06:00."
+    return [DateTime]::Today.AddHours(6)
+}
+
+function Normalize-StringArray {
+    param($Value)
+
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) { return @($Value) }
+    return [string[]]$Value
+}
+
 function Invoke-DeploymentUpdate {
     param(
         [Parameter(Mandatory)] [pscustomobject]$Metadata,
         [Parameter(Mandatory)] [string]$TargetDirectory,
         [Parameter(Mandatory)] [string]$TaskNamePrefix,
+        [Parameter(Mandatory)] [DateTime]$TriggerTime,
+        [Parameter(Mandatory)] [string]$Repo,
+        [Parameter(Mandatory)] [string]$FallbackBranch,
+        [Parameter(Mandatory)] [string]$ConfigRelativePath,
+        [string]$ConfigSourceUrl,
         [Parameter()] [hashtable]$BoundParameters
     )
 
@@ -92,6 +196,8 @@ function Invoke-DeploymentUpdate {
     $targetPath = Join-Path -Path $TargetDirectory -ChildPath ("check-diskspace v{0}.ps1" -f $remoteVersion)
     Write-Host "Downloading check-diskspace.ps1 (version $remoteVersion)"
     Invoke-WebRequest -Uri $Metadata.DownloadUri -OutFile $targetPath -UseBasicParsing
+
+    Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -Metadata $Metadata -Repo $Repo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $ConfigSourceUrl -ForceDownload:($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://')
 
     Get-ChildItem -Path $TargetDirectory -Filter 'check-diskspace v*.ps1' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $targetPath } |
@@ -116,14 +222,14 @@ function Invoke-DeploymentUpdate {
 
     $escapedTargetPath = $targetPath.Replace('"', '""')
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$escapedTargetPath`""
-    $trigger = New-ScheduledTaskTrigger -Daily -At 6:00AM
+    $trigger = New-ScheduledTaskTrigger -Daily -At $TriggerTime
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -Compatibility Win8 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
     $taskName = "{0} (v{1})" -f $TaskNamePrefix, $remoteVersion
-    Write-Verbose "Registering scheduled task '$taskName'"
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Runs check-diskspace.ps1 v$remoteVersion at 6 AM daily" -Force | Out-Null
-    Write-Host "Scheduled task '$taskName' created to run $targetPath at 6 AM daily."
+    $taskDescription = "Runs check-diskspace.ps1 v{0} at {1} daily" -f $remoteVersion, $TriggerTime.ToShortTimeString()
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $taskDescription -Force | Out-Null
+    Write-Host ("Scheduled task '{0}' created to run {1} at {2} daily." -f $taskName, $targetPath, $TriggerTime.ToShortTimeString())
 
     if (-not $BoundParameters) { $BoundParameters = @{} }
     $relaunchParams = @{}
@@ -147,23 +253,32 @@ function Invoke-SelfUpdate {
         [Parameter(Mandatory)] [string]$FallbackBranch,
         [Parameter(Mandatory)] [string]$TargetDirectory,
         [Parameter(Mandatory)] [string]$TaskNamePrefix,
+        [Parameter(Mandatory)] [DateTime]$TriggerTime,
         [Parameter(Mandatory)] [string]$ScriptPath,
+        [Parameter(Mandatory)] [string]$ConfigRelativePath,
+        [string]$ConfigSourceUrl,
+        [pscustomobject]$Metadata,
         [Parameter()] [hashtable]$BoundParameters
     )
 
-    $localVersion = Get-LocalScriptVersion -ScriptPath $ScriptPath
-    $metadata = Get-RemoteScriptMetadata -Repo $Repo -AssetPath $AssetPath -FallbackBranch $FallbackBranch
-    if (-not $metadata) { return }
+    if (-not $ScriptPath) {
+        Write-Verbose 'Self-update skipped because script path could not be determined.'
+        return
+    }
 
-    $remoteVersion = $metadata.Version
+    if (-not $Metadata) {
+        $Metadata = Get-RemoteScriptMetadata -Repo $Repo -AssetPath $AssetPath -FallbackBranch $FallbackBranch
+    }
+
+    $localVersion = Get-LocalScriptVersion -ScriptPath $ScriptPath
+    $remoteVersion = $Metadata.Version
     $comparePerformed = $false
     $shouldUpdate = $false
 
     try {
         $currentVersionObj = $null
         $remoteVersionObj = $null
-        if ([System.Version]::TryParse($localVersion, [ref]$currentVersionObj) -and
-            [System.Version]::TryParse($remoteVersion, [ref]$remoteVersionObj)) {
+        if ([System.Version]::TryParse($localVersion, [ref]$currentVersionObj) -and [System.Version]::TryParse($remoteVersion, [ref]$remoteVersionObj)) {
             $comparePerformed = $true
             $shouldUpdate = ($remoteVersionObj -gt $currentVersionObj)
         }
@@ -177,34 +292,87 @@ function Invoke-SelfUpdate {
 
     if ($shouldUpdate) {
         Write-Host "Self-update: local version $localVersion, remote version $remoteVersion"
-        Invoke-DeploymentUpdate -Metadata $metadata -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -BoundParameters $BoundParameters
+        Invoke-DeploymentUpdate -Metadata $Metadata -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -TriggerTime $TriggerTime -Repo $Repo -FallbackBranch $FallbackBranch -ConfigRelativePath $ConfigRelativePath -ConfigSourceUrl $ConfigSourceUrl -BoundParameters $BoundParameters
     } else {
         Write-Verbose "Self-update: local version $localVersion is up to date (remote $remoteVersion)."
     }
 }
 
+$scriptDirectory = Get-ScriptDirectory -Path $PSCommandPath
+$configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
+$configSourceUrl = $env:CheckDiskSpaceConfig
+$forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
+
+$initialMetadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
+Ensure-ConfigFile -ConfigPath $configPath -Metadata $initialMetadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
+$config = Load-Configuration -ConfigPath $configPath
+
+if (-not $PSBoundParameters.ContainsKey('GitHubRepo') -and $config.GitHubRepo) { $GitHubRepo = $config.GitHubRepo }
+if (-not $PSBoundParameters.ContainsKey('AssetRelativePath') -and $config.AssetRelativePath) { $AssetRelativePath = $config.AssetRelativePath }
+if (-not $PSBoundParameters.ContainsKey('FallbackBranch') -and $config.FallbackBranch) { $FallbackBranch = $config.FallbackBranch }
+if (-not $PSBoundParameters.ContainsKey('TaskNamePrefix') -and $config.TaskNamePrefix) { $TaskNamePrefix = $config.TaskNamePrefix }
+if (-not $PSBoundParameters.ContainsKey('TargetDirectory') -and $config.TargetDirectory) { $TargetDirectory = $config.TargetDirectory }
+if (-not $PSBoundParameters.ContainsKey('ScheduleTime') -and $config.ScheduleTime) { $ScheduleTime = $config.ScheduleTime }
+
+if (-not $TaskNamePrefix) { $TaskNamePrefix = 'Check Disk Space' }
+if (-not $TargetDirectory) { $TargetDirectory = $scriptDirectory }
+if (-not $ScheduleTime) { $ScheduleTime = '06:00' }
+
+if (-not $PSBoundParameters.ContainsKey('PercentUsedThreshold') -and $config.PercentUsedThreshold -ne $null) {
+    $PercentUsedThreshold = [int]$config.PercentUsedThreshold
+}
+if (-not $PSBoundParameters.ContainsKey('MinFreeGB') -and $config.MinFreeGB -ne $null) {
+    $MinFreeGB = [int]$config.MinFreeGB
+}
+if (-not $PercentUsedThreshold) { $PercentUsedThreshold = 90 }
+if (-not $MinFreeGB) { $MinFreeGB = 50 }
+
+if ($PercentUsedThreshold -lt 1 -or $PercentUsedThreshold -gt 100) {
+    throw "PercentUsedThreshold must be between 1 and 100."
+}
+if ($MinFreeGB -lt 0) {
+    throw "MinFreeGB must be zero or greater."
+}
+
+$metadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
+$triggerTime = Get-DailyTriggerTime -TimeString $ScheduleTime
+
 if (-not $DisableSelfUpdate -and -not $SkipSelfUpdate) {
     try {
-        Invoke-SelfUpdate -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
+        Invoke-SelfUpdate -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -TriggerTime $triggerTime -ScriptPath $PSCommandPath -ConfigRelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -Metadata $metadata -BoundParameters $PSBoundParameters
     } catch [System.OperationCanceledException] {
         return
     }
 }
 
-$SmtpServer = 'nettek-com.mail.protection.outlook.com'
-$From = 'noreply@nettek.com'
+$SmtpServer = if ($config.SmtpServer) { [string]$config.SmtpServer } else { 'nettek-com.mail.protection.outlook.com' }
+$SmtpPort = if ($config.SmtpPort) { [int]$config.SmtpPort } else { 25 }
+$UseSsl = if ($config.UseSsl -ne $null) { [bool]$config.UseSsl } else { $true }
+$From = if ($config.From) { [string]$config.From } else { 'noreply@nettek.com' }
+$defaultTo = Normalize-StringArray -Value $config.To
+$debugTo = Normalize-StringArray -Value $config.DebugTo
 
 if ($debug) {
-    $To = 'dabrames@nettek.com'
+    if ($debugTo.Count -gt 0) {
+        $To = $debugTo
+    } elseif ($defaultTo.Count -gt 0) {
+        $To = $defaultTo
+    } else {
+        $To = @('dabrames@nettek.com')
+    }
 } else {
-    $To = 'help@nettek.com'
+    if ($defaultTo.Count -gt 0) {
+        $To = $defaultTo
+    } else {
+        $To = @('help@nettek.com')
+    }
 }
 
-$SmtpPort = 25
-$UseSsl = $true
+$SubjectPrefix = if ($config.SubjectPrefix) { [string]$config.SubjectPrefix } else { $null }
 $ComputerName = $env:COMPUTERNAME
 $timestampSubject = Get-Date -Format 'MM-dd-yy HH:mm'
-$Subject = "Disk space alert on $ComputerName ($timestampSubject)"
+$subjectCore = "Disk space alert on $ComputerName ($timestampSubject)"
+$Subject = if ($SubjectPrefix) { "{0} {1}" -f $SubjectPrefix.Trim(), $subjectCore } else { $subjectCore }
 
 try {
     $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3'
@@ -308,7 +476,7 @@ if ($csvVolumes) {
 
             if (-not $volume -and $info.PSObject.Properties['MountPoints'] -and $info.MountPoints) {
                 foreach ($mountPoint in $info.MountPoints) {
-                    $normalized = if ($mountPoint.EndsWith('\')) { $mountPoint } else { "$mountPoint\" }
+                    $normalized = if ($mountPoint.EndsWith('\\')) { $mountPoint } else { "$mountPoint\\" }
                     $volume = $allVolumes | Where-Object { $_.Name -eq $normalized }
                     if ($volume) { break }
                 }
@@ -399,7 +567,7 @@ if ($alertDisks -or $debug) {
             if ($Credential) { $mailParams.Credential = $Credential }
 
             Send-MailMessage @mailParams
-            Write-Host "Alert email sent to $To."
+            Write-Host "Alert email sent to $($To -join ', ')."
         } catch {
             Write-Error "Failed to send alert email. $_"
         }
