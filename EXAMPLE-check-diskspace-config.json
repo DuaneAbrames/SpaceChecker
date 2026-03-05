@@ -1,6 +1,38 @@
 {
-  "PercentUsedThreshold": 95,
-  "MinFreeGB": 10,
+  "Thresholds": {
+    "OS": {
+      "DriveLetters": [
+        "C:"
+      ],
+      "FreeGB": {
+        "Warn": 20,
+        "Crit": 10,
+        "Emerg": 5
+      },
+      "PercentUsed": null
+    },
+    "Data": {
+      "Warn": {
+        "PercentUsed": 90,
+        "MinFreeGB": 100,
+        "Mode": "AND"
+      },
+      "Crit": {
+        "PercentUsed": 95,
+        "MinFreeGB": 50,
+        "Mode": "AND"
+      },
+      "Emerg": {
+        "PercentUsed": 98,
+        "MinFreeGB": 20,
+        "Mode": "OR"
+      }
+    }
+  },
+  "AlertPolicy": {
+    "SendWarnOnDayOfWeek": "Sunday",
+    "IncludeWarnInEmailBody": true
+  },
   "SmtpServer": "YOUR_SMTP_SERVER",
   "SmtpPort": 25,
   "UseSsl": true,

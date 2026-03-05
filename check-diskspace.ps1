@@ -16,7 +16,6 @@ param(
     [string]$ScheduleTime,
     [string]$ConfigRelativePath = 'check-diskspace-config.json'
 )
-$debug = $true
 function Get-ScriptDirectory {
     param([string]$Path)
 
@@ -174,6 +173,104 @@ function Normalize-StringArray {
     return [string[]]$Value
 }
 
+function Normalize-DriveLetter {
+    param([string]$DriveLetter)
+
+    if ([string]::IsNullOrWhiteSpace($DriveLetter)) { return $null }
+    $normalized = $DriveLetter.Trim().ToUpper()
+    if ($normalized -match '^[A-Z]$') { return "$($normalized):" }
+    if ($normalized -match '^[A-Z]:$') { return $normalized }
+    return $normalized
+}
+
+function Get-ThresholdValue {
+    param(
+        $Node,
+        [string]$PropertyName,
+        [double]$DefaultValue
+    )
+
+    if ($Node -and $Node.PSObject.Properties[$PropertyName] -and $Node.$PropertyName -ne $null) {
+        return [double]$Node.$PropertyName
+    }
+    return [double]$DefaultValue
+}
+
+function Test-ThresholdCondition {
+    param(
+        [double]$UsedPercentExact,
+        [double]$FreeGBExact,
+        [double]$PercentUsed,
+        [double]$MinFreeGB,
+        [string]$Mode
+    )
+
+    $modeUpper = if ($Mode) { $Mode.Trim().ToUpper() } else { 'AND' }
+    $percentHit = $UsedPercentExact -ge $PercentUsed
+    $freeHit = $FreeGBExact -lt $MinFreeGB
+    if ($modeUpper -eq 'OR') { return ($percentHit -or $freeHit) }
+    return ($percentHit -and $freeHit)
+}
+
+function Get-SeverityRank {
+    param([string]$Severity)
+
+    switch ($Severity) {
+        'OK' { return 0 }
+        'WARN' { return 1 }
+        'CRIT' { return 2 }
+        'EMERG' { return 3 }
+        default { return -1 }
+    }
+}
+
+function Get-HighestSeverity {
+    param([object[]]$Items)
+
+    if (-not $Items) { return 'OK' }
+    return ($Items | Sort-Object { Get-SeverityRank -Severity $_.Severity } -Descending | Select-Object -First 1).Severity
+}
+
+function Get-DiskSeverity {
+    param(
+        [string]$DriveLetter,
+        [double]$SizeBytes,
+        [double]$FreeBytes,
+        [double]$UsedPercentExact,
+        [bool]$IsOSVolume,
+        [hashtable]$Config
+    )
+
+    $freeGBExact = if ($FreeBytes -ge 0) { $FreeBytes / 1GB } else { 0 }
+
+    if ($IsOSVolume) {
+        $os = $Config.OS
+        $severity = 'OK'
+        if ($freeGBExact -lt [double]$os.FreeGB.Warn) { $severity = 'WARN' }
+        if ($freeGBExact -lt [double]$os.FreeGB.Crit) { $severity = 'CRIT' }
+        if ($freeGBExact -lt [double]$os.FreeGB.Emerg) { $severity = 'EMERG' }
+
+        if ($freeGBExact -lt [double]$os.FreeGB.Warn -and $os.PercentUsed) {
+            $percentSeverity = 'OK'
+            if ($UsedPercentExact -ge [double]$os.PercentUsed.Warn) { $percentSeverity = 'WARN' }
+            if ($UsedPercentExact -ge [double]$os.PercentUsed.Crit) { $percentSeverity = 'CRIT' }
+            if ($UsedPercentExact -ge [double]$os.PercentUsed.Emerg) { $percentSeverity = 'EMERG' }
+
+            if ((Get-SeverityRank -Severity $percentSeverity) -gt (Get-SeverityRank -Severity $severity)) {
+                $severity = $percentSeverity
+            }
+        }
+
+        return $severity
+    }
+
+    $data = $Config.Data
+    if (Test-ThresholdCondition -UsedPercentExact $UsedPercentExact -FreeGBExact $freeGBExact -PercentUsed ([double]$data.Emerg.PercentUsed) -MinFreeGB ([double]$data.Emerg.MinFreeGB) -Mode $data.Emerg.Mode) { return 'EMERG' }
+    if (Test-ThresholdCondition -UsedPercentExact $UsedPercentExact -FreeGBExact $freeGBExact -PercentUsed ([double]$data.Crit.PercentUsed) -MinFreeGB ([double]$data.Crit.MinFreeGB) -Mode $data.Crit.Mode) { return 'CRIT' }
+    if (Test-ThresholdCondition -UsedPercentExact $UsedPercentExact -FreeGBExact $freeGBExact -PercentUsed ([double]$data.Warn.PercentUsed) -MinFreeGB ([double]$data.Warn.MinFreeGB) -Mode $data.Warn.Mode) { return 'WARN' }
+    return 'OK'
+}
+
 function Invoke-DeploymentUpdate {
     param(
         [Parameter(Mandatory)] [pscustomobject]$Metadata,
@@ -320,31 +417,77 @@ if (-not $TaskNamePrefix) { $TaskNamePrefix = 'Check Disk Space' }
 if (-not $TargetDirectory) { $TargetDirectory = $scriptDirectory }
 if (-not $ScheduleTime) { $ScheduleTime = '06:00' }
 
-if (-not $PSBoundParameters.ContainsKey('PercentUsedThreshold') -and $config.PercentUsedThreshold -ne $null) {
-    $PercentUsedThreshold = [int]$config.PercentUsedThreshold
-}
-if (-not $PSBoundParameters.ContainsKey('MinFreeGB') -and $config.MinFreeGB -ne $null) {
-    $MinFreeGB = [int]$config.MinFreeGB
-}
-if (-not $PercentUsedThreshold) { $PercentUsedThreshold = 90 }
-if (-not $MinFreeGB) { $MinFreeGB = 50 }
+$thresholdsNode = $config.Thresholds
+$osNode = if ($thresholdsNode -and $thresholdsNode.OS) { $thresholdsNode.OS } else { $null }
+$osFreeNode = if ($osNode -and $osNode.FreeGB) { $osNode.FreeGB } else { $null }
+$osPercentNode = if ($osNode -and $osNode.PercentUsed) { $osNode.PercentUsed } else { $null }
+$dataNode = if ($thresholdsNode -and $thresholdsNode.Data) { $thresholdsNode.Data } else { $null }
+$dataWarnNode = if ($dataNode -and $dataNode.Warn) { $dataNode.Warn } else { $null }
+$dataCritNode = if ($dataNode -and $dataNode.Crit) { $dataNode.Crit } else { $null }
+$dataEmergNode = if ($dataNode -and $dataNode.Emerg) { $dataNode.Emerg } else { $null }
 
-if ($PercentUsedThreshold -lt 1 -or $PercentUsedThreshold -gt 100) {
-    throw "PercentUsedThreshold must be between 1 and 100."
+$osDriveLetters = Normalize-StringArray -Value $(if ($osNode -and $osNode.DriveLetters) { $osNode.DriveLetters } else { @('C:') })
+if (-not $osDriveLetters -or $osDriveLetters.Count -eq 0) { $osDriveLetters = @('C:') }
+$osDriveLetters = $osDriveLetters | ForEach-Object { Normalize-DriveLetter -DriveLetter $_ } | Where-Object { $_ } | Select-Object -Unique
+if (-not $osDriveLetters -or $osDriveLetters.Count -eq 0) { $osDriveLetters = @('C:') }
+
+$osPercentUsedConfig = $null
+if ($osPercentNode -and $osPercentNode -ne [System.DBNull]::Value) {
+    $osPercentUsedConfig = @{
+        Warn  = Get-ThresholdValue -Node $osPercentNode -PropertyName 'Warn' -DefaultValue 90
+        Crit  = Get-ThresholdValue -Node $osPercentNode -PropertyName 'Crit' -DefaultValue 95
+        Emerg = Get-ThresholdValue -Node $osPercentNode -PropertyName 'Emerg' -DefaultValue 98
+    }
 }
-if ($MinFreeGB -lt 0) {
-    throw "MinFreeGB must be zero or greater."
+
+$thresholdConfig = @{
+    OS = @{
+        DriveLetters = $osDriveLetters
+        FreeGB = @{
+            Warn  = Get-ThresholdValue -Node $osFreeNode -PropertyName 'Warn' -DefaultValue 20
+            Crit  = Get-ThresholdValue -Node $osFreeNode -PropertyName 'Crit' -DefaultValue 10
+            Emerg = Get-ThresholdValue -Node $osFreeNode -PropertyName 'Emerg' -DefaultValue 5
+        }
+        PercentUsed = $osPercentUsedConfig
+    }
+    Data = @{
+        Warn = @{
+            PercentUsed = Get-ThresholdValue -Node $dataWarnNode -PropertyName 'PercentUsed' -DefaultValue 90
+            MinFreeGB   = Get-ThresholdValue -Node $dataWarnNode -PropertyName 'MinFreeGB' -DefaultValue 100
+            Mode        = if ($dataWarnNode -and $dataWarnNode.Mode) { ([string]$dataWarnNode.Mode).Trim().ToUpper() } else { 'AND' }
+        }
+        Crit = @{
+            PercentUsed = Get-ThresholdValue -Node $dataCritNode -PropertyName 'PercentUsed' -DefaultValue 95
+            MinFreeGB   = Get-ThresholdValue -Node $dataCritNode -PropertyName 'MinFreeGB' -DefaultValue 50
+            Mode        = if ($dataCritNode -and $dataCritNode.Mode) { ([string]$dataCritNode.Mode).Trim().ToUpper() } else { 'AND' }
+        }
+        Emerg = @{
+            PercentUsed = Get-ThresholdValue -Node $dataEmergNode -PropertyName 'PercentUsed' -DefaultValue 98
+            MinFreeGB   = Get-ThresholdValue -Node $dataEmergNode -PropertyName 'MinFreeGB' -DefaultValue 20
+            Mode        = if ($dataEmergNode -and $dataEmergNode.Mode) { ([string]$dataEmergNode.Mode).Trim().ToUpper() } else { 'OR' }
+        }
+    }
 }
+
+$alertPolicyNode = $config.AlertPolicy
+$warnDayOfWeek = if ($alertPolicyNode -and $alertPolicyNode.SendWarnOnDayOfWeek) { [string]$alertPolicyNode.SendWarnOnDayOfWeek } else { 'Sunday' }
+$warnDayOfWeek = if ([string]::IsNullOrWhiteSpace($warnDayOfWeek)) { 'Sunday' } else { $warnDayOfWeek.Trim() }
+$includeWarnInEmailBody = if ($alertPolicyNode -and $alertPolicyNode.PSObject.Properties['IncludeWarnInEmailBody']) { [bool]$alertPolicyNode.IncludeWarnInEmailBody } else { $true }
+$isSunday = (Get-Date).DayOfWeek -eq 'Sunday'
+$isWarnTriggerDay = (Get-Date).DayOfWeek.ToString().Equals($warnDayOfWeek, [System.StringComparison]::OrdinalIgnoreCase)
+$warnGateDayMatch = if ($warnDayOfWeek -eq 'Sunday') { $isSunday } else { $isWarnTriggerDay }
 
 $metadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
 $triggerTime = Get-DailyTriggerTime -TimeString $ScheduleTime
 
-if (-not $DisableSelfUpdate -and -not $SkipSelfUpdate) {
+if (-not $DisableSelfUpdate -and -not $SkipSelfUpdate -and -not $debug) {
     try {
         Invoke-SelfUpdate -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -TriggerTime $triggerTime -ScriptPath $PSCommandPath -ConfigRelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -Metadata $metadata -BoundParameters $PSBoundParameters
     } catch [System.OperationCanceledException] {
         return
     }
+} elseif ($debug) {
+    Write-Verbose 'Self-update skipped because debug mode is enabled.'
 }
 
 $SmtpServer = if ($config.SmtpServer) { [string]$config.SmtpServer } else { 'nettek-com.mail.protection.outlook.com' }
@@ -354,27 +497,11 @@ $From = if ($config.From) { [string]$config.From } else { 'noreply@nettek.com' }
 $defaultTo = Normalize-StringArray -Value $config.To
 $debugTo = Normalize-StringArray -Value $config.DebugTo
 
-if ($debug) {
-    if ($debugTo.Count -gt 0) {
-        $To = $debugTo
-    } elseif ($defaultTo.Count -gt 0) {
-        $To = $defaultTo
-    } else {
-        $To = @('dabrames@nettek.com')
-    }
-} else {
-    if ($defaultTo.Count -gt 0) {
-        $To = $defaultTo
-    } else {
-        $To = @('help@nettek.com')
-    }
-}
+$primaryTo = if ($defaultTo.Count -gt 0) { $defaultTo } else { @('help@nettek.com') }
+$debugRecipients = if ($debugTo.Count -gt 0) { $debugTo } elseif ($defaultTo.Count -gt 0) { $defaultTo } else { @('dabrames@nettek.com') }
 
 $SubjectPrefix = if ($config.SubjectPrefix) { [string]$config.SubjectPrefix } else { $null }
 $ComputerName = $env:COMPUTERNAME
-$timestampSubject = Get-Date -Format 'MM-dd-yy HH:mm'
-$subjectCore = "Disk space alert on $ComputerName ($timestampSubject)"
-$Subject = if ($SubjectPrefix) { "{0} {1}" -f $SubjectPrefix.Trim(), $subjectCore } else { $subjectCore }
 
 try {
     $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3'
@@ -392,10 +519,14 @@ $report = @()
 foreach ($disk in $disks) {
     if (-not $disk.Size) { continue }
 
+    $driveLetter = Normalize-DriveLetter -DriveLetter $disk.DeviceID
+    $isOSVolume = $thresholdConfig.OS.DriveLetters -contains $driveLetter
     $sizeBytes = [double]$disk.Size
     $freeBytes = [double]$disk.FreeSpace
     $freeGBExact = $freeBytes / 1GB
     $usedPercentExact = if ($sizeBytes -eq 0) { 0 } else { (($sizeBytes - $freeBytes) / $sizeBytes) * 100 }
+    $severity = Get-DiskSeverity -DriveLetter $driveLetter -SizeBytes $sizeBytes -FreeBytes $freeBytes -UsedPercentExact $usedPercentExact -IsOSVolume $isOSVolume -Config $thresholdConfig
+    $alertTriggered = ($severity -in @('CRIT', 'EMERG')) -or (($severity -eq 'WARN') -and $warnGateDayMatch)
 
     $report += [pscustomobject]@{
         ComputerName   = $disk.SystemName
@@ -403,7 +534,9 @@ foreach ($disk in $disks) {
         SizeGB         = [Math]::Round($sizeBytes / 1GB, 2)
         FreeGB         = [Math]::Round($freeGBExact, 2)
         UsedPercent    = [Math]::Round($usedPercentExact, 1)
-        AlertTriggered = ($usedPercentExact -ge $PercentUsedThreshold) -or ($freeGBExact -lt $MinFreeGB)
+        Severity       = $severity
+        IsOSVolume     = $isOSVolume
+        AlertTriggered = $alertTriggered
         Source         = 'LogicalDisk'
     }
 }
@@ -495,6 +628,8 @@ if ($csvVolumes) {
 
         $freeGBExact = $freeBytes / 1GB
         $usedPercentExact = if ($sizeBytes -eq 0) { 0 } else { (($sizeBytes - $freeBytes) / $sizeBytes) * 100 }
+        $severity = Get-DiskSeverity -DriveLetter $displayName -SizeBytes $sizeBytes -FreeBytes $freeBytes -UsedPercentExact $usedPercentExact -IsOSVolume $false -Config $thresholdConfig
+        $alertTriggered = ($severity -in @('CRIT', 'EMERG')) -or (($severity -eq 'WARN') -and $warnGateDayMatch)
 
         $report += [pscustomobject]@{
             ComputerName   = $ComputerName
@@ -502,7 +637,9 @@ if ($csvVolumes) {
             SizeGB         = [Math]::Round($sizeBytes / 1GB, 2)
             FreeGB         = [Math]::Round($freeGBExact, 2)
             UsedPercent    = [Math]::Round($usedPercentExact, 1)
-            AlertTriggered = ($usedPercentExact -ge $PercentUsedThreshold) -or ($freeGBExact -lt $MinFreeGB)
+            Severity       = $severity
+            IsOSVolume     = $false
+            AlertTriggered = $alertTriggered
             Source         = 'CSV'
         }
     }
@@ -514,67 +651,98 @@ if (-not $report) {
 }
 
 $sortedReport = $report | Sort-Object Source, Drive
-$reportTable = $sortedReport | Format-Table Drive, SizeGB, FreeGB, UsedPercent, AlertTriggered, Source -AutoSize | Out-String
+$reportTable = $sortedReport | Format-Table Drive, SizeGB, FreeGB, UsedPercent, Severity, IsOSVolume, AlertTriggered, Source -AutoSize | Out-String
 Write-Host $reportTable
 
-$alertDisks = $sortedReport | Where-Object { $_.AlertTriggered }
-Write-Host "debug: $debug"
+$triggeredAlerts = $sortedReport | Where-Object { $_.AlertTriggered }
+$shouldSendPrimary = ($triggeredAlerts.Count -gt 0)
+$shouldSendDebug = [bool]$debug
 
-if ($alertDisks -or $debug) {
-    $thresholdDescription = "Thresholds: used >= $PercentUsedThreshold% or free < $MinFreeGB GB."
-    if ($clusterDetected) {
-        $thresholdDescription += ' Cluster Shared Volumes detected.'
-    }
+if ($shouldSendPrimary -or $shouldSendDebug) {
     $timestampBody = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $timestampSubject = Get-Date -Format 'MM-dd-yy HH:mm'
+    $warnGateDescription = if ($warnDayOfWeek) { $warnDayOfWeek } else { 'Sunday' }
+    $osPolicy = "OS policy (drives: {0}) FreeGB tiers: WARN < {1}, CRIT < {2}, EMERG < {3}. OS PercentUsed: {4}." -f ($thresholdConfig.OS.DriveLetters -join ', '), $thresholdConfig.OS.FreeGB.Warn, $thresholdConfig.OS.FreeGB.Crit, $thresholdConfig.OS.FreeGB.Emerg, $(if ($thresholdConfig.OS.PercentUsed) { "enabled (Warn>=$($thresholdConfig.OS.PercentUsed.Warn), Crit>=$($thresholdConfig.OS.PercentUsed.Crit), Emerg>=$($thresholdConfig.OS.PercentUsed.Emerg)) and applied only when FreeGB is already below WARN" } else { 'not set' })
+    $dataPolicy = "Data policy: WARN (UsedPercent >= {0} AND FreeGB < {1}), CRIT (UsedPercent >= {2} AND FreeGB < {3}), EMERG (UsedPercent >= {4} {5} FreeGB < {6})." -f $thresholdConfig.Data.Warn.PercentUsed, $thresholdConfig.Data.Warn.MinFreeGB, $thresholdConfig.Data.Crit.PercentUsed, $thresholdConfig.Data.Crit.MinFreeGB, $thresholdConfig.Data.Emerg.PercentUsed, $thresholdConfig.Data.Emerg.Mode.ToUpper(), $thresholdConfig.Data.Emerg.MinFreeGB
+    $gatingPolicy = "Alert policy: CRIT/EMERG always trigger; WARN triggers on $warnGateDescription."
 
-    $driveBlocks = foreach ($item in $sortedReport) {
-        $status = if ($item.AlertTriggered) { '***ALERT***' } else { 'OK' }
+    $emailReportItems = if ($includeWarnInEmailBody) { $sortedReport } else { $sortedReport | Where-Object { $_.Severity -ne 'WARN' } }
+    if (-not $emailReportItems -or $emailReportItems.Count -eq 0) { $emailReportItems = $sortedReport }
+
+    $driveBlocks = foreach ($item in $emailReportItems) {
+        $status = switch ($item.Severity) {
+            'EMERG' { '***EMERGENCY***' }
+            'CRIT' { '***ALERT***' }
+            'WARN' { 'WARN' }
+            default { 'OK' }
+        }
         $sizeDisplay = ('{0:N2} GB' -f $item.SizeGB)
         $freeDisplay = ('{0:N2} GB' -f $item.FreeGB)
         $usedDisplay = ('{0:N1}%' -f $item.UsedPercent)
+        $volumePolicy = if ($item.IsOSVolume) { 'OS' } else { 'Data' }
 
         $lines = @(
             "Drive $($item.Drive):    $status",
+            "Severity:    $($item.Severity)",
+            "Policy:    $volumePolicy",
+            "Triggered:    $($item.AlertTriggered)",
             "Size:    $sizeDisplay",
             "Free:    $freeDisplay",
             "Used Percent:    $usedDisplay"
         )
-
         $lines -join [Environment]::NewLine
     }
 
     $bodySections = $driveBlocks -join ([Environment]::NewLine + [Environment]::NewLine)
-
     $bodyLines = @(
         "Disk space report for $ComputerName generated at $timestampBody.",
-        $thresholdDescription,
+        "Script version: $($metadata.Version) from release '$($metadata.ReleaseTag)'.",
+        $gatingPolicy,
+        $osPolicy,
+        $dataPolicy,
+        $(if ($clusterDetected) { 'Cluster Shared Volumes detected.' } else { $null }),
         '',
         $bodySections
-    )
-
+    ) | Where-Object { $_ -ne $null }
     $body = ($bodyLines -join [Environment]::NewLine).TrimEnd()
 
-    if ($SmtpServer -and $To -and $From) {
-        try {
-            $mailParams = @{
-                SmtpServer = $SmtpServer
-                Port       = $SmtpPort
-                To         = $To
-                From       = $From
-                Subject    = $Subject
-                Body       = $body
+    $highestTriggeredSeverity = Get-HighestSeverity -Items $triggeredAlerts
+    $highestSeenSeverity = Get-HighestSeverity -Items $sortedReport
+    $subjectSeverity = if ($shouldSendPrimary) { $highestTriggeredSeverity } else { $highestSeenSeverity }
+    $subjectTags = @("[{0}]" -f $subjectSeverity)
+    if (-not $shouldSendPrimary -and $shouldSendDebug) { $subjectTags += '[DEBUG]' }
+    $subjectCore = "Disk space alert on $ComputerName ($timestampSubject)"
+    $subjectWithTags = "{0} {1}" -f ($subjectTags -join ''), $subjectCore
+    $Subject = if ($SubjectPrefix) { "{0} {1}" -f $SubjectPrefix.Trim(), $subjectWithTags } else { $subjectWithTags }
+
+    $recipientSets = @()
+    if ($shouldSendPrimary) { $recipientSets += ,@{ Name = 'primary'; Recipients = $primaryTo } }
+    if ($shouldSendDebug) { $recipientSets += ,@{ Name = 'debug'; Recipients = $debugRecipients } }
+
+    foreach ($recipientSet in $recipientSets) {
+        $To = $recipientSet.Recipients
+        if ($SmtpServer -and $To -and $From) {
+            try {
+                $mailParams = @{
+                    SmtpServer = $SmtpServer
+                    Port       = $SmtpPort
+                    To         = $To
+                    From       = $From
+                    Subject    = $Subject
+                    Body       = $body
+                }
+
+                if ($UseSsl) { $mailParams.UseSsl = $true }
+                if ($Credential) { $mailParams.Credential = $Credential }
+
+                Send-MailMessage @mailParams
+                Write-Host "Alert email sent to $($To -join ', ') [$($recipientSet.Name)]."
+            } catch {
+                Write-Error "Failed to send alert email to $($recipientSet.Name) recipients. $_"
             }
-
-            if ($UseSsl) { $mailParams.UseSsl = $true }
-            if ($Credential) { $mailParams.Credential = $Credential }
-
-            Send-MailMessage @mailParams
-            Write-Host "Alert email sent to $($To -join ', ')."
-        } catch {
-            Write-Error "Failed to send alert email. $_"
+        } else {
+            Write-Warning 'Alert conditions met but email parameters were not fully specified.'
         }
-    } else {
-        Write-Warning 'Alert thresholds exceeded but email parameters were not fully specified.'
     }
 } else {
     Write-Host "All disks are within thresholds for $ComputerName."
