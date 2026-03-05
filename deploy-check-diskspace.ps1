@@ -26,7 +26,21 @@ Set-StrictMode -Version Latest
 $scriptDirectory = if ($PSCommandPath) { Split-Path -Path $PSCommandPath -Parent } else { (Get-Location).ProviderPath }
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
 
+function Resolve-CnameTarget {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
 
+    try {
+        $result = Resolve-DnsName -Name $Name -Type CNAME -ErrorAction Stop
+        return $result.NameHost
+    }
+    catch {
+        # Not a CNAME or lookup failed — return the original name
+        return $Name
+    }
+}
 function Get-PrimaryDnsDomain {
     # Try common sources for the machine's primary DNS domain and return the first usable value.
     $candidates = @()
@@ -55,7 +69,11 @@ function Get-ConfigUrlFromPrimaryDomain {
     if (-not $ConfigFileName) { $ConfigFileName = 'check-diskspace-config.json' }
 
     $fileName = $ConfigFileName.TrimStart('/','\').TrimStart('/','\').TrimStart('/','\')
-    return "https://space.{0}/{1}" -f $domain.Trim(), $fileName
+    $URLHost = "space.{0}" -f $domain.Trim()
+    # If the constructed host is a CNAME, resolve it to get the actual target hostname for 
+    # better compatibility with SSL certs and hosting providers.  (also useful for split-DNS setups)
+    $URLHost = Resolve-CnameTarget -Name $URLHost
+    return "https://$URLHost/$fileName"
 }
 
 

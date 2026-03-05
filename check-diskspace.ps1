@@ -1,10 +1,4 @@
 param(
-    [ValidateRange(1,100)]
-    [int]$PercentUsedThreshold = 95,
-
-    [ValidateRange(0,[int]::MaxValue)]
-    [int]$MinFreeGB = 10,
-
     [switch]$debug,
     [switch]$DisableSelfUpdate,
     [switch]$SkipSelfUpdate,
@@ -395,9 +389,64 @@ function Invoke-SelfUpdate {
     }
 }
 
+function Resolve-CnameTarget {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    try {
+        $result = Resolve-DnsName -Name $Name -Type CNAME -ErrorAction Stop
+        return $result.NameHost
+    }
+    catch {
+        # Not a CNAME or lookup failed — return the original name
+        return $Name
+    }
+}
+
+function Get-PrimaryDnsDomain {
+    # Try common sources for the machine's primary DNS domain and return the first usable value.
+    $candidates = @()
+
+    if ($env:USERDNSDOMAIN) { $candidates += $env:USERDNSDOMAIN }
+
+    try {
+        $csDomain = (Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop).Domain
+        if ($csDomain -and $csDomain -ne $env:COMPUTERNAME) { $candidates += $csDomain }
+    } catch {}
+
+    try {
+        $dnsSettings = Get-DnsClientGlobalSetting -ErrorAction Stop
+        if ($dnsSettings.PrimaryDnsSuffix) { $candidates += $dnsSettings.PrimaryDnsSuffix }
+        if ($dnsSettings.SuffixSearchList) { $candidates += $dnsSettings.SuffixSearchList }
+    } catch {}
+
+    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1).ToLowerInvariant()
+}
+
+function Get-ConfigUrlFromPrimaryDomain {
+    param([string]$ConfigFileName = $ConfigRelativePath)
+
+    $domain = Get-PrimaryDnsDomain
+    if (-not $domain) { return $null }
+    if (-not $ConfigFileName) { $ConfigFileName = 'check-diskspace-config.json' }
+
+    $fileName = $ConfigFileName.TrimStart('/','\').TrimStart('/','\').TrimStart('/','\')
+    $URLHost = "space.{0}" -f $domain.Trim()
+    # If the constructed host is a CNAME, resolve it to get the actual target hostname for 
+    # better compatibility with SSL certs and hosting providers.  (also useful for split-DNS setups)
+    $URLHost = Resolve-CnameTarget -Name $URLHost
+    return "https://$URLHost/$fileName"
+}
+
+
 $scriptDirectory = Get-ScriptDirectory -Path $PSCommandPath
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
 $configSourceUrl = $env:CheckDiskSpaceConfig
+if (-not $configSourceUrl) {
+    $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
+}   
 $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
 if ($forceConfigDownload) {
     Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
