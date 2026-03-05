@@ -2,7 +2,7 @@ This is a personal project for on-the-cheap disk space monitoring.
 
 It has two components:
 - the main script "check-diskspace.ps1" which can be downloaded and run, or scheduled to run.
-- the deployer script "deploy-check-diskspace.ps1" which is desinged to download the current version of the script from here on GitHub and run it daily.
+- the deployer script "deploy-check-diskspace.ps1" which is desinged to download the current version of the script from here on GitHub and schedule it to run daily.
 
 *Features*
 - has configurable thresholds for alerting (minimim free space and percent of space used)
