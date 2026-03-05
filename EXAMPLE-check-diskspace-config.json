@@ -1,0 +1,21 @@
+{
+  "PercentUsedThreshold": 95,
+  "MinFreeGB": 10,
+  "SmtpServer": "YOUR_SMTP_SERVER",
+  "SmtpPort": 25,
+  "UseSsl": true,
+  "From": "YOUR_SMTP_FROM_ADDRESS",
+  "To": [
+    "YOUR_SMTP_TO_ADDRESS"
+  ],
+  "DebugTo": [
+    "YOUR_SMTP_DEBUG_ADDRESS"
+  ],
+  "SubjectPrefix": null,
+  "GitHubRepo": "DuaneAbrames/SpaceChecker",
+  "AssetRelativePath": "check-diskspace.ps1",
+  "FallbackBranch": "main",
+  "TargetDirectory": "C:\\istools",
+  "TaskNamePrefix": "Check Disk Space",
+  "ScheduleTime": "06:00"
+}
