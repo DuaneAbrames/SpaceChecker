@@ -32,13 +32,20 @@ function Resolve-CnameTarget {
         [string]$Name
     )
 
+    $normalizedName = $Name.Trim().Trim('.')
+    if (-not $normalizedName) { return $null }
+
     try {
-        $result = Resolve-DnsName -Name $Name -Type CNAME -ErrorAction Stop
-        return $result.NameHost
+        $result = Resolve-DnsName -Name $normalizedName -Type CNAME -ErrorAction Stop
+        $nameHost = @($result | ForEach-Object { $_.NameHost } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+        if ($nameHost.Count -gt 0) {
+            return $nameHost[0].Trim().TrimEnd('.')
+        }
+        return $normalizedName
     }
     catch {
         # Not a CNAME or lookup failed — return the original name
-        return $Name
+        return $normalizedName
     }
 }
 function Get-PrimaryDnsDomain {
@@ -58,7 +65,13 @@ function Get-PrimaryDnsDomain {
         if ($dnsSettings.SuffixSearchList) { $candidates += $dnsSettings.SuffixSearchList }
     } catch {}
 
-    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1).ToLowerInvariant()
+    $domain = $candidates |
+        ForEach-Object { if ($_) { $_.ToString().Trim().Trim('.') } } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch '^WORKGROUP$' } |
+        Select-Object -First 1
+
+    if ($domain) { return $domain.ToLowerInvariant() }
+    return $null
 }
 
 function Get-ConfigUrlFromPrimaryDomain {
@@ -73,6 +86,10 @@ function Get-ConfigUrlFromPrimaryDomain {
     # If the constructed host is a CNAME, resolve it to get the actual target hostname for 
     # better compatibility with SSL certs and hosting providers.  (also useful for split-DNS setups)
     $URLHost = Resolve-CnameTarget -Name $URLHost
+    if ([string]::IsNullOrWhiteSpace($URLHost)) {
+        Write-Warning "Unable to derive a valid config host from primary DNS domain '$domain'."
+        return $null
+    }
     return "https://$URLHost/$fileName"
 }
 
@@ -85,7 +102,7 @@ if ($env:CheckDiskSpaceConfig) {
 } else {
     Write-Host "Environment variable 'CheckDiskSpaceConfig' is not set."
 }
-if ($configSourceUrl -like "") {
+if ([string]::IsNullOrWhiteSpace($configSourceUrl)) {
     $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
     if ($configSourceUrl) {
         Write-Host "Constructed config source URL based on primary DNS domain: $configSourceUrl"
@@ -95,13 +112,15 @@ if ($configSourceUrl -like "") {
 }
 
 # Persist the resolved config URL for future runs (machine scope).
-if ($configSourceUrl) {
+if ($configSourceUrl -and $configSourceUrl -match '^https?://[^/]+') {
     try {
         [Environment]::SetEnvironmentVariable('CheckDiskSpaceConfig', $configSourceUrl, 'Machine')
         Write-Host "Persisted config source URL '$configSourceUrl' to machine environment variable 'CheckDiskSpaceConfig'"
     } catch {
         Write-Warning "Unable to persist CheckDiskSpaceConfig at machine scope: $($_.Exception.Message)"
     }
+} elseif ($configSourceUrl) {
+    Write-Warning "Resolved config URL '$configSourceUrl' is not valid and was not persisted."
 }
 
 $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
@@ -166,10 +185,6 @@ function Get-RemoteScriptMetadata {
 function Ensure-ConfigFile {
     param(
         [Parameter(Mandatory)] [string]$ConfigPath,
-        [pscustomobject]$Metadata,
-        [Parameter(Mandatory)] [string]$Repo,
-        [Parameter(Mandatory)] [string]$FallbackBranch,
-        [Parameter(Mandatory)] [string]$RelativePath,
         [string]$ConfigSourceUrl,
         [switch]$ForceDownload
     )
@@ -187,22 +202,8 @@ function Ensure-ConfigFile {
 
     if ($downloaded) { return }
 
-    if ($ForceDownload -or -not (Test-Path -Path $ConfigPath)) {
-        $tagsToTry = @()
-        if ($Metadata -and $Metadata.ReleaseTag) { $tagsToTry += $Metadata.ReleaseTag }
-        if (-not $tagsToTry.Contains($FallbackBranch)) { $tagsToTry += $FallbackBranch }
-
-        foreach ($tag in $tagsToTry) {
-            $configUri = "https://raw.githubusercontent.com/$Repo/$tag/$RelativePath"
-            try {
-                Invoke-WebRequest -Uri $configUri -OutFile $ConfigPath -UseBasicParsing -ErrorAction Stop
-                Write-Host "Configuration downloaded from $configUri"
-                $downloaded = $true
-                break
-            } catch {
-                Write-Warning "Failed to download configuration from ${configUri}: $($_.Exception.Message)"
-            }
-        }
+    if ($ForceDownload -and $ConfigSourceUrl) {
+        Write-Warning "Proceeding with local configuration at $ConfigPath because forced download from $ConfigSourceUrl failed."
     }
 
     if (-not (Test-Path -Path $ConfigPath)) {
@@ -246,7 +247,7 @@ function Get-DailyTriggerTime {
 }
 
 $metadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
-Ensure-ConfigFile -ConfigPath $configPath -Metadata $metadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
+Ensure-ConfigFile -ConfigPath $configPath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
 $config = Load-Configuration -ConfigPath $configPath
 
 if (-not $PSBoundParameters.ContainsKey('GitHubRepo') -and $config.GitHubRepo) { $GitHubRepo = $config.GitHubRepo }
@@ -261,7 +262,7 @@ if (-not $TaskNamePrefix) { $TaskNamePrefix = 'Check Disk Space' }
 if (-not $ScheduleTime) { $ScheduleTime = '06:00' }
 
 $metadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
-Ensure-ConfigFile -ConfigPath $configPath -Metadata $metadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
+Ensure-ConfigFile -ConfigPath $configPath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
 
 $triggerTime = Get-DailyTriggerTime -TimeString $ScheduleTime
 
@@ -270,7 +271,7 @@ if (-not (Test-Path -Path $TargetDirectory)) {
     New-Item -Path $TargetDirectory -ItemType Directory -Force | Out-Null
 }
 
-Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -Metadata $metadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
+Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
 
 $targetPath = Join-Path -Path $TargetDirectory -ChildPath ("check-diskspace v{0}.ps1" -f $metadata.Version)
 Write-Host "Downloading check-diskspace.ps1 (version $($metadata.Version))"

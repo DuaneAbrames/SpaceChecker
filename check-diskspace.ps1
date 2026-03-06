@@ -79,22 +79,10 @@ function Get-RemoteScriptMetadata {
 function Ensure-ConfigFile {
     param(
         [Parameter(Mandatory)] [string]$ConfigPath,
-        [pscustomobject]$Metadata,
-        [Parameter(Mandatory)] [string]$Repo,
-        [Parameter(Mandatory)] [string]$FallbackBranch,
-        [Parameter(Mandatory)] [string]$RelativePath,
+        [string]$ConfigSourceUrl,
         [switch]$ForceDownload
     )
-    $configSourceUrl = $env:CheckDiskSpaceConfig
-    Write-Debug "Initial configuration source URL from environment variable: $configSourceUrl"
-    if (-not $configSourceUrl) {
-        Write-Debug "No configuration source URL provided via environment variable; attempting to derive from primary DNS domain."
-        $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
-    }   
-    $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
-    if ($forceConfigDownload) {
-        Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
-    }
+
     $downloaded = $false
     if ($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://') {
         try {
@@ -108,22 +96,8 @@ function Ensure-ConfigFile {
 
     if ($downloaded) { return }
 
-    if ($ForceDownload -or -not (Test-Path -Path $ConfigPath)) {
-        $tagsToTry = @()
-        if ($Metadata -and $Metadata.ReleaseTag) { $tagsToTry += $Metadata.ReleaseTag }
-        if (-not $tagsToTry.Contains($FallbackBranch)) { $tagsToTry += $FallbackBranch }
-
-        foreach ($tag in $tagsToTry) {
-            $configUri = "https://raw.githubusercontent.com/$Repo/$tag/$RelativePath"
-            try {
-                Invoke-WebRequest -Uri $configUri -OutFile $ConfigPath -UseBasicParsing -ErrorAction Stop
-                Write-Host "Configuration downloaded from $configUri"
-                $downloaded = $true
-                break
-            } catch {
-                Write-Warning "Failed to download configuration from $($configUri): $($_.Exception.Message)"
-            }
-        }
+    if ($ForceDownload -and $ConfigSourceUrl) {
+        Write-Warning "Proceeding with local configuration at $ConfigPath because forced download from $ConfigSourceUrl failed."
     }
 
     if (-not (Test-Path -Path $ConfigPath)) {
@@ -295,7 +269,7 @@ function Invoke-DeploymentUpdate {
     Write-Host "Downloading check-diskspace.ps1 (version $remoteVersion)"
     Invoke-WebRequest -Uri $Metadata.DownloadUri -OutFile $targetPath -UseBasicParsing
 
-    Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -Metadata $Metadata -Repo $Repo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath 
+    Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -ConfigSourceUrl $ConfigSourceUrl -ForceDownload:([bool]($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://'))
 
     Get-ChildItem -Path $TargetDirectory -Filter 'check-diskspace v*.ps1' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $targetPath } |
@@ -402,13 +376,20 @@ function Resolve-CnameTarget {
         [string]$Name
     )
 
+    $normalizedName = $Name.Trim().Trim('.')
+    if (-not $normalizedName) { return $null }
+
     try {
-        $result = Resolve-DnsName -Name $Name -Type CNAME -ErrorAction Stop
-        return $result.NameHost
+        $result = Resolve-DnsName -Name $normalizedName -Type CNAME -ErrorAction Stop
+        $nameHost = @($result | ForEach-Object { $_.NameHost } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+        if ($nameHost.Count -gt 0) {
+            return $nameHost[0].Trim().TrimEnd('.')
+        }
+        return $normalizedName
     }
     catch {
         # Not a CNAME or lookup failed — return the original name
-        return $Name
+        return $normalizedName
     }
 }
 
@@ -429,7 +410,13 @@ function Get-PrimaryDnsDomain {
         if ($dnsSettings.SuffixSearchList) { $candidates += $dnsSettings.SuffixSearchList }
     } catch {}
 
-    return ($candidates | Where-Object { $_ -and $_ -notmatch '^WORKGROUP$' } | Select-Object -First 1).ToLowerInvariant()
+    $domain = $candidates |
+        ForEach-Object { if ($_) { $_.ToString().Trim().Trim('.') } } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notmatch '^WORKGROUP$' } |
+        Select-Object -First 1
+
+    if ($domain) { return $domain.ToLowerInvariant() }
+    return $null
 }
 
 function Get-ConfigUrlFromPrimaryDomain {
@@ -444,6 +431,10 @@ function Get-ConfigUrlFromPrimaryDomain {
     # If the constructed host is a CNAME, resolve it to get the actual target hostname for 
     # better compatibility with SSL certs and hosting providers.  (also useful for split-DNS setups)
     $URLHost = Resolve-CnameTarget -Name $URLHost
+    if ([string]::IsNullOrWhiteSpace($URLHost)) {
+        Write-Warning "Unable to derive a valid config host from primary DNS domain '$domain'."
+        return $null
+    }
     return "https://$URLHost/$fileName"
 }
 
@@ -460,8 +451,7 @@ $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^ht
 if ($forceConfigDownload) {
     Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
 }
-$initialMetadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
-Ensure-ConfigFile -ConfigPath $configPath -Metadata $initialMetadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath 
+Ensure-ConfigFile -ConfigPath $configPath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
 $config = Load-Configuration -ConfigPath $configPath
 
 if (-not $PSBoundParameters.ContainsKey('GitHubRepo') -and $config.GitHubRepo) { $GitHubRepo = $config.GitHubRepo }
