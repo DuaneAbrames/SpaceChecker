@@ -15,8 +15,6 @@ You can do the following:
 1. distribute the config file manually via whatever method you choose
 2. hard-code the URL during the deploy script run either from command line, or editing the script before runtim
 3. the script will fallback to a url constructed from "space" and the primary DNS domain of the machine (eg https://space.example.org)
-     ** Important:  Due to ssl certificates and the realities of hosting files on a web server, I am using a slightly odd DNS lookup
-     ** mechanic - if your URL DNS record is a CNAME, the script will use the target of the CNAME in the URL.  This is so I can
-     ** have multiple internal domains, point their space.<domain> DNS record to the same CNAME, and have the cert and SNI work.
+   Important:  Due to ssl certificates and the realities of hosting files on a web server, I am using a slightly odd DNS lookup mechanic - if your URL DNS record is a CNAME, the script will use the target of the CNAME in the URL.  This is so I can have multiple internal domains, point their space.<domain> DNS record to the same CNAME, and have the cert and SNI work.
 
 I have provided an example config file, you will need to edit it for your site-specific configuration (SMTP)
