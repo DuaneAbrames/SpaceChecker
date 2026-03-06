@@ -1,7 +1,6 @@
 param(
     [switch]$debug,
     [switch]$DisableSelfUpdate,
-    [switch]$SkipSelfUpdate,
     [string]$GitHubRepo = 'DuaneAbrames/SpaceChecker',
     [string]$AssetRelativePath = 'check-diskspace.ps1',
     [string]$FallbackBranch = 'main',
@@ -84,10 +83,18 @@ function Ensure-ConfigFile {
         [Parameter(Mandatory)] [string]$Repo,
         [Parameter(Mandatory)] [string]$FallbackBranch,
         [Parameter(Mandatory)] [string]$RelativePath,
-        [string]$ConfigSourceUrl,
         [switch]$ForceDownload
     )
-
+    $configSourceUrl = $env:CheckDiskSpaceConfig
+    Write-Debug "Initial configuration source URL from environment variable: $configSourceUrl"
+    if (-not $configSourceUrl) {
+        Write-Debug "No configuration source URL provided via environment variable; attempting to derive from primary DNS domain."
+        $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
+    }   
+    $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
+    if ($forceConfigDownload) {
+        Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
+    }
     $downloaded = $false
     if ($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://') {
         try {
@@ -288,7 +295,7 @@ function Invoke-DeploymentUpdate {
     Write-Host "Downloading check-diskspace.ps1 (version $remoteVersion)"
     Invoke-WebRequest -Uri $Metadata.DownloadUri -OutFile $targetPath -UseBasicParsing
 
-    Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -Metadata $Metadata -Repo $Repo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $ConfigSourceUrl -ForceDownload:($ConfigSourceUrl -and $ConfigSourceUrl -match '^https?://')
+    Ensure-ConfigFile -ConfigPath (Join-Path $TargetDirectory $ConfigRelativePath) -Metadata $Metadata -Repo $Repo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath 
 
     Get-ChildItem -Path $TargetDirectory -Filter 'check-diskspace v*.ps1' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -ne $targetPath } |
@@ -444,7 +451,9 @@ function Get-ConfigUrlFromPrimaryDomain {
 $scriptDirectory = Get-ScriptDirectory -Path $PSCommandPath
 $configPath = Join-Path -Path $scriptDirectory -ChildPath $ConfigRelativePath
 $configSourceUrl = $env:CheckDiskSpaceConfig
+Write-Debug "Initial configuration source URL from environment variable: $configSourceUrl"
 if (-not $configSourceUrl) {
+    Write-Debug "No configuration source URL provided via environment variable; attempting to derive from primary DNS domain."
     $configSourceUrl = Get-ConfigUrlFromPrimaryDomain -ConfigFileName $ConfigRelativePath
 }   
 $forceConfigDownload = [bool]($configSourceUrl -and $configSourceUrl -match '^https?://')
@@ -452,7 +461,7 @@ if ($forceConfigDownload) {
     Write-Host "Configuration source URL provided via environment variable: $configSourceUrl"
 }
 $initialMetadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
-Ensure-ConfigFile -ConfigPath $configPath -Metadata $initialMetadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -ForceDownload:$forceConfigDownload
+Ensure-ConfigFile -ConfigPath $configPath -Metadata $initialMetadata -Repo $GitHubRepo -FallbackBranch $FallbackBranch -RelativePath $ConfigRelativePath 
 $config = Load-Configuration -ConfigPath $configPath
 
 if (-not $PSBoundParameters.ContainsKey('GitHubRepo') -and $config.GitHubRepo) { $GitHubRepo = $config.GitHubRepo }
@@ -529,7 +538,7 @@ $warnGateDayMatch = if ($warnDayOfWeek -eq 'Sunday') { $isSunday } else { $isWar
 $metadata = Get-RemoteScriptMetadata -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch
 $triggerTime = Get-DailyTriggerTime -TimeString $ScheduleTime
 
-if (-not $DisableSelfUpdate -and -not $SkipSelfUpdate -and -not $debug) {
+if (-not $DisableSelfUpdate -and -not $DisableSelfUpdate -and -not $debug) {
     try {
         Invoke-SelfUpdate -Repo $GitHubRepo -AssetPath $AssetRelativePath -FallbackBranch $FallbackBranch -TargetDirectory $TargetDirectory -TaskNamePrefix $TaskNamePrefix -TriggerTime $triggerTime -ScriptPath $PSCommandPath -ConfigRelativePath $ConfigRelativePath -ConfigSourceUrl $configSourceUrl -Metadata $metadata -BoundParameters $PSBoundParameters
     } catch [System.OperationCanceledException] {
