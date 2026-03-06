@@ -702,7 +702,7 @@ $sortedReport = $report | Sort-Object Source, Drive
 $reportTable = $sortedReport | Format-Table Drive, SizeGB, FreeGB, UsedPercent, Severity, IsOSVolume, AlertTriggered, Source -AutoSize | Out-String
 Write-Host $reportTable
 
-$triggeredAlerts = $sortedReport | Where-Object { $_.AlertTriggered }
+$triggeredAlerts = @($sortedReport | Where-Object { $_.AlertTriggered })
 $shouldSendPrimary = ($triggeredAlerts.Count -gt 0)
 $shouldSendDebug = [bool]$debug
 
