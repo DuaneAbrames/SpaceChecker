@@ -744,13 +744,14 @@ if ($shouldSendPrimary -or $shouldSendDebug) {
     $bodySections = $driveBlocks -join ([Environment]::NewLine + [Environment]::NewLine)
     $bodyLines = @(
         "Disk space report for $ComputerName generated at $timestampBody.",
+        '',
+        $bodySections,
+        '',
         "Script version: $($metadata.Version) from release '$($metadata.ReleaseTag)'.",
         $gatingPolicy,
         $osPolicy,
         $dataPolicy,
-        $(if ($clusterDetected) { 'Cluster Shared Volumes detected.' } else { $null }),
-        '',
-        $bodySections
+        $(if ($clusterDetected) { 'Cluster Shared Volumes detected.' } else { $null })
     ) | Where-Object { $_ -ne $null }
     $body = ($bodyLines -join [Environment]::NewLine).TrimEnd()
 
